@@ -78,6 +78,15 @@ def populate_cmap_combo(combo: QComboBox, default: str = None):
         combo.setCurrentText(default)
     elif first_cmap_index is not None:
         combo.setCurrentIndex(first_cmap_index)
+def populate_field_combo(combo: QComboBox, fields, default: str = None):
+    """Populate a combo box with detected field names."""
+    combo.clear()
+    combo.addItem("")
+    for field_name in sorted(fields):
+        combo.addItem(field_name)
+    if default and default in fields:
+        combo.setCurrentText(default)
+
 MAP_TYPES = ['Density', 'Energy', 'Velocity']
 VELOCITY_COMPONENTS = ['vx', 'vy', 'vz']
 VEL_INDEX = {'vx': 0, 'vy': 1, 'vz': 2}
@@ -390,6 +399,10 @@ class PlotOptionsDialog(QDialog):
         self.map_dropdown.addItems(MAP_TYPES)
         layout.addRow("Map type:", self.map_dropdown)
 
+        # Field override
+        self.field_dropdown = QComboBox()
+        layout.addRow("Field override:", self.field_dropdown)
+
         # Velocity component
         self.vel_dropdown = QComboBox()
         self.vel_dropdown.addItems(VELOCITY_COMPONENTS)
@@ -461,6 +474,7 @@ class PlotOptionsDialog(QDialog):
         self.cmap_dropdown.setCurrentText(p.cmap_dropdown.currentText())
         self.stream_cmap_dropdown.setCurrentText(p.stream_cmap_dropdown.currentText())
         self.map_dropdown.setCurrentText(p.map_dropdown.currentText())
+        populate_field_combo(self.field_dropdown, p.available_field_names(), p.field_dropdown.currentText())
         self.vel_dropdown.setCurrentText(p.vel_dropdown.currentText())
         self.fixed_cbar_checkbox.setChecked(p.fixed_cbar_enabled)
         self.fixed_cbar_snap_spin.setMaximum(p.fixed_cbar_snap_spin.maximum())
@@ -485,6 +499,7 @@ class PlotOptionsDialog(QDialog):
         p.cmap_dropdown.setCurrentText(self.cmap_dropdown.currentText())
         p.stream_cmap_dropdown.setCurrentText(self.stream_cmap_dropdown.currentText())
         p.map_dropdown.setCurrentText(self.map_dropdown.currentText())
+        p.field_dropdown.setCurrentText(self.field_dropdown.currentText())
         p.vel_dropdown.setCurrentText(self.vel_dropdown.currentText())
         p.fixed_cbar_enabled = self.fixed_cbar_checkbox.isChecked()
         p.fixed_cbar_snap_spin.setValue(self.fixed_cbar_snap_spin.value())
@@ -656,6 +671,8 @@ class PlotInteractiveWindow(QWidget):
         self.stream_cmap_dropdown.addItems(COLORMAPS)
         self.map_dropdown = QComboBox()
         self.map_dropdown.addItems(MAP_TYPES)
+        self.field_dropdown = QComboBox()
+        self.field_dropdown.setEnabled(False)
         self.vel_dropdown = QComboBox()
         self.vel_dropdown.addItems(VELOCITY_COMPONENTS)
         self.fixed_cbar_checkbox = QCheckBox("Fixed colorbar range")
@@ -699,6 +716,22 @@ class PlotInteractiveWindow(QWidget):
         self.vel_dropdown.clear()
         self.vel_dropdown.addItems(desired)
         self.vel_dropdown.blockSignals(False)
+
+    def available_field_names(self):
+        if not self.sim:
+            return []
+        try:
+            snap = int(self.time_slider.value()) if hasattr(self, 'time_slider') else 0
+            return list(self.sim.available_fields(snapshot=snap).keys())
+        except Exception:
+            return []
+
+    def refresh_field_dropdown(self):
+        fields = self.available_field_names()
+        default = self.field_dropdown.currentText().strip() if hasattr(self, 'field_dropdown') else None
+        if default not in fields:
+            default = 'gasdens' if 'gasdens' in fields else (fields[0] if fields else None)
+        populate_field_combo(self.field_dropdown, fields, default)
 
     def _reflect_coordinates(self, axis, X, Y):
         if axis == "X-axis":
@@ -1289,6 +1322,8 @@ class PlotInteractiveWindow(QWidget):
             'Velocity': None,
             'Energy': None
         }
+        self.refresh_field_dropdown()
+        self.field_dropdown.setEnabled(True)
         # Ensure default colormap is applied when a simulation is loaded
         try:
             self.cmap_dropdown.setCurrentText('inferno')
@@ -1573,6 +1608,14 @@ class PlotInteractiveWindow(QWidget):
         map_types = MAP_TYPES
         vel_comp = self.vel_dropdown.currentText() if hasattr(self, 'vel_dropdown') else 'vx'
         snap = self.fixed_cbar_snap_spin.value()
+        selected_field = self.field_dropdown.currentText().strip() if hasattr(self, 'field_dropdown') else ''
+        try:
+            field_catalog = self.sim.available_fields(snapshot=snap)
+        except Exception:
+            field_catalog = {}
+        selected_field_type = field_catalog.get(selected_field)
+        scalar_field_name = selected_field if selected_field and selected_field_type == 'scalar' else None
+        vector_field_name = selected_field if selected_field and selected_field_type == 'vector' else None
 
         # Determine axes and mesh names based on fixed coordinates (same logic as plot_density)
         def is_fixed(var, slice_str):
@@ -1609,8 +1652,10 @@ class PlotInteractiveWindow(QWidget):
         for map_type in map_types:
             try:
                 if map_type == 'Density':
+                    density_field = scalar_field_name or 'gasdens'
+                    vector_field = vector_field_name or 'gasv'
                     data = self.sim.load_field(
-                        fields=['gasdens', 'gasv'],
+                        fields=[density_field, vector_field],
                         slice=slice_str,
                         snapshot=snap
                     )
@@ -1621,18 +1666,19 @@ class PlotInteractiveWindow(QWidget):
                         ys = np.linspace(ymin, ymax, res)
                         X, Y = np.meshgrid(xs, ys)
                         if use_var3:
-                            data_map = data.evaluate(field='gasdens', time=snap, var1=X, var3=Y)
+                            data_map = data.evaluate(field=density_field, time=snap, var1=X, var3=Y)
                         else:
-                            data_map = data.evaluate(field='gasdens', time=snap, var1=X, var2=Y)
+                            data_map = data.evaluate(field=density_field, time=snap, var1=X, var2=Y)
                         dens_raw = data_map * self.sim.URHO
                         data_map = np.where(dens_raw > 0, np.log10(dens_raw), np.nan)
                     else:
-                        dens_raw = data.gasdens_mesh[0] * self.sim.URHO
+                        dens_raw = getattr(data, f'{density_field}_mesh')[0] * self.sim.URHO
                         valid_mask = dens_raw > 0
                         data_map = np.where(valid_mask, np.log10(dens_raw), np.nan)
                 elif map_type == 'Velocity':
+                    vector_field = vector_field_name or 'gasv'
                     gasv = self.sim.load_field(
-                        fields='gasv',
+                        fields=vector_field,
                         slice=slice_str,
                         snapshot=snap
                     )
@@ -1644,9 +1690,9 @@ class PlotInteractiveWindow(QWidget):
                         ys = np.linspace(ymin, ymax, res)
                         X, Y = np.meshgrid(xs, ys)
                         if use_var3:
-                            vel = gasv.evaluate(time=snap, var1=X, var3=Y)
+                            vel = gasv.evaluate(field=vector_field, time=snap, var1=X, var3=Y)
                         else:
-                            vel = gasv.evaluate(time=snap, var1=X, var2=Y)
+                            vel = gasv.evaluate(field=vector_field, time=snap, var1=X, var2=Y)
                         idx = VEL_INDEX.get(vel_comp, 0)
                         # Convert to km/s (consistent with plot_density)
                         v_factor = self.sim.UL / self.sim.UT
@@ -1654,7 +1700,7 @@ class PlotInteractiveWindow(QWidget):
                         denom = 1e5 if sim_unitsys == "cgs" else 1e3
                         data_map = (vel[idx] * v_factor) / denom
                     else:
-                        vel = gasv.gasv_mesh[0]
+                        vel = getattr(gasv, f'{vector_field}_mesh')[0]
                         idx = VEL_INDEX.get(vel_comp, 0)
                         # Convert to km/s (consistent with plot_density)
                         v_factor = self.sim.UL / self.sim.UT
@@ -1662,8 +1708,10 @@ class PlotInteractiveWindow(QWidget):
                         denom = 1e5 if sim_unitsys == "cgs" else 1e3
                         data_map = (vel[idx] * v_factor) / denom
                 elif map_type == 'Energy':
+                    energy_field = scalar_field_name or 'gasenergy'
+                    vector_field = vector_field_name or 'gasv'
                     gasenergy = self.sim.load_field(
-                        fields='gasenergy',
+                        fields=energy_field,
                         slice=slice_str,
                         snapshot=snap
                     )
@@ -1674,11 +1722,11 @@ class PlotInteractiveWindow(QWidget):
                         ys = np.linspace(ymin, ymax, res)
                         X, Y = np.meshgrid(xs, ys)
                         if use_var3:
-                            data_map = gasenergy.evaluate(time=snap, var1=X, var3=Y)
+                            data_map = gasenergy.evaluate(field=energy_field, time=snap, var1=X, var3=Y)
                         else:
-                            data_map = gasenergy.evaluate(time=snap, var1=X, var2=Y)
+                            data_map = gasenergy.evaluate(field=energy_field, time=snap, var1=X, var2=Y)
                     else:
-                        data_map = gasenergy.gasenergy_mesh[0]
+                        data_map = getattr(gasenergy, f'{energy_field}_mesh')[0]
                 # Ignore NaNs for min/max
                 valid = np.isfinite(data_map)
                 if np.any(valid):
@@ -1778,6 +1826,14 @@ class PlotInteractiveWindow(QWidget):
         map_type = self.map_dropdown.currentText()
         vel_comp = self.vel_dropdown.currentText()
         n = self.time_slider.value()
+        selected_field = self.field_dropdown.currentText().strip() if hasattr(self, 'field_dropdown') else ''
+        try:
+            field_catalog = self.sim.available_fields(snapshot=n)
+        except Exception:
+            field_catalog = {}
+        selected_field_type = field_catalog.get(selected_field)
+        scalar_field_name = selected_field if selected_field and selected_field_type == 'scalar' else None
+        vector_field_name = selected_field if selected_field and selected_field_type == 'vector' else None
 
         # --- UNITS ---
         sim_unitsys = getattr(self.sim, "unitsystem", "cgs").lower()
@@ -1835,25 +1891,30 @@ class PlotInteractiveWindow(QWidget):
 
         # Load data according to selection
         if map_type == 'Density':
+            density_field = scalar_field_name or 'gasdens'
+            vector_field = vector_field_name or 'gasv'
             data = self.sim.load_field(
-                fields=['gasdens', 'gasv'],
+                fields=[density_field, vector_field],
                 slice=slice_str,
                 snapshot=n
             )
         elif map_type == 'Energy':
+            energy_field = scalar_field_name or 'gasenergy'
+            vector_field = vector_field_name or 'gasv'
             gasenergy = self.sim.load_field(
-                fields='gasenergy',
+                fields=energy_field,
                 slice=slice_str,
                 snapshot=n
             )
             gasv = self.sim.load_field(
-                fields='gasv',
+                fields=vector_field,
                 slice=slice_str,
                 snapshot=n
             )
         elif map_type == 'Velocity':
+            vector_field = vector_field_name or 'gasv'
             gasv = self.sim.load_field(
-                fields='gasv',
+                fields=vector_field,
                 slice=slice_str,
                 snapshot=n
             )
@@ -1875,14 +1936,14 @@ class PlotInteractiveWindow(QWidget):
                 ys = np.linspace(ymin, ymax, res)
                 X, Y = np.meshgrid(xs, ys)
                 if map_type == 'Density':
-                    data_map = data.evaluate(field='gasdens', time=n, var1=X, var2=Y)
+                    data_map = data.evaluate(field=density_field, time=n, var1=X, var2=Y)
                     data_map = np.log10(data_map * self.sim.URHO)
-                    vel = data.evaluate(field='gasv', time=n, var1=X, var2=Y)
+                    vel = data.evaluate(field=vector_field, time=n, var1=X, var2=Y)
                     vx = vel[0]
                     vy = vel[1]
                     vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Energy':
-                    data_map = gasenergy.evaluate(time=n, var1=X, var2=Y)
+                    data_map = gasenergy.evaluate(field=energy_field, time=n, var1=X, var2=Y)
                     vel = gasv.evaluate(time=n, var1=X, var2=Y)
                     vx = vel[0]
                     vy = vel[1]
@@ -1901,14 +1962,14 @@ class PlotInteractiveWindow(QWidget):
                 zs = np.linspace(zmin, zmax, res)
                 X, Y = np.meshgrid(xs, zs)
                 if map_type == 'Density':
-                    data_map = data.evaluate(field='gasdens', time=n, var1=X, var3=Y)
+                    data_map = data.evaluate(field=density_field, time=n, var1=X, var3=Y)
                     data_map = np.log10(data_map * self.sim.URHO)
-                    vel = data.evaluate(field='gasv', time=n, var1=X, var3=Y)
+                    vel = data.evaluate(field=vector_field, time=n, var1=X, var3=Y)
                     vx = vel[0]
                     vy = vel[2]
                     vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Energy':
-                    data_map = gasenergy.evaluate(time=n, var1=X, var3=Y)
+                    data_map = gasenergy.evaluate(field=energy_field, time=n, var1=X, var3=Y)
                     vel = gasv.evaluate(time=n, var1=X, var3=Y)
                     vx = vel[0]
                     vy = vel[2]
@@ -1925,19 +1986,19 @@ class PlotInteractiveWindow(QWidget):
                 X = getattr(mesh_source, mesh_x_name)[0]
                 Y = getattr(mesh_source, mesh_y_name)[0]
                 if map_type == 'Density':
-                    data_map = np.log10(data.gasdens_mesh[0] * self.sim.URHO)
-                    vel = data.gasv_mesh[0]
+                    data_map = np.log10(getattr(data, f'{density_field}_mesh')[0] * self.sim.URHO)
+                    vel = getattr(data, f'{vector_field}_mesh')[0]
                     vx = vel[0]
                     vy = vel[1]
                     vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Energy':
-                    data_map = gasenergy.gasenergy_mesh[0]
-                    vel = gasv.gasv_mesh[0]
+                    data_map = getattr(gasenergy, f'{energy_field}_mesh')[0]
+                    vel = getattr(gasv, f'{vector_field}_mesh')[0]
                     vx = vel[0]
                     vy = vel[1]
                     vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Velocity':
-                    vel = gasv.gasv_mesh[0]
+                    vel = getattr(gasv, f'{vector_field}_mesh')[0]
                     idx = VEL_INDEX[vel_comp]
                     data_map = vel[idx]
                     vx = vel[0]
@@ -1947,19 +2008,19 @@ class PlotInteractiveWindow(QWidget):
                 X = getattr(mesh_source, mesh_x_name)[0]
                 Y = getattr(mesh_source, mesh_y_name)[0]
                 if map_type == 'Density':
-                    data_map = np.log10(data.gasdens_mesh[0] * self.sim.URHO)
-                    vel = data.gasv_mesh[0]
+                    data_map = np.log10(getattr(data, f'{density_field}_mesh')[0] * self.sim.URHO)
+                    vel = getattr(data, f'{vector_field}_mesh')[0]
                     vx = vel[0]
                     vy = vel[2]
                     vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Energy':
-                    data_map = gasenergy.gasenergy_mesh[0]
-                    vel = gasv.gasv_mesh[0]
+                    data_map = getattr(gasenergy, f'{energy_field}_mesh')[0]
+                    vel = getattr(gasv, f'{vector_field}_mesh')[0]
                     vx = vel[0]
                     vy = vel[2]
                     vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Velocity':
-                    vel = gasv.gasv_mesh[0]
+                    vel = getattr(gasv, f'{vector_field}_mesh')[0]
                     idx = {'vx': 0, 'vy': 1, 'vz': 2}[vel_comp]
                     data_map = vel[idx]
                     vx = vel[0]

@@ -433,6 +433,7 @@ class FieldInterpolator(fargopy.Fargobj):
         self._grid_axes = None
         self._axis_order = None
         self._original_coords = None
+        self._field_types = {}
 
     def _reset_caches(self):
         """Clear cached dataframe and slice metadata before loading or evaluating new data."""
@@ -547,6 +548,26 @@ class FieldInterpolator(fargopy.Fargobj):
                 ranges[key] = (parsed, parsed)
         return ranges
 
+    def _infer_slice_dim(self, coords_system, slice_ranges):
+        """Infer the intrinsic dimensionality of a slice from the fixed coordinates."""
+        if not slice_ranges:
+            return 3
+
+        if coords_system == 'spherical':
+            axes = ('r', 'theta', 'phi')
+        elif coords_system == 'cylindrical':
+            axes = ('r', 'phi', 'z')
+        else:
+            axes = ('x', 'y', 'z')
+
+        free_axes = 0
+        for axis in axes:
+            bounds = slice_ranges.get(axis)
+            if bounds is None or bounds[0] != bounds[1]:
+                free_axes += 1
+
+        return max(1, free_axes)
+
     def _get_sorted_dataframe(self, dataframe):
         """Return the dataframe sorted by normalized time, reusing a cached copy when possible."""
         if self._df_sorted_cache and self._df_sorted_cache[0] is dataframe:
@@ -611,101 +632,66 @@ class FieldInterpolator(fargopy.Fargobj):
         """
         if cut is None:
             return None
-            
+
         dom = self.sim.domains
-        
-        # Get coordinate arrays
+
         if coords_system == 'spherical':
+            theta_arr = dom.theta
             r_arr = dom.r
             phi_arr = dom.phi
-            theta_arr = dom.theta
-            
-            # Build full 3D mesh to detect affected regions
-            theta_mesh, r_mesh, phi_mesh = np.meshgrid(
-                theta_arr, r_arr, phi_arr, indexing='ij'
-            )
+            theta_mesh, r_mesh, phi_mesh = np.meshgrid(theta_arr, r_arr, phi_arr, indexing='ij')
             x = r_mesh * np.sin(theta_mesh) * np.cos(phi_mesh)
             y = r_mesh * np.sin(theta_mesh) * np.sin(phi_mesh)
             z = r_mesh * np.cos(theta_mesh)
-            
         elif coords_system == 'cylindrical':
+            z_arr = dom.z
             r_arr = dom.r
             phi_arr = dom.phi
-            z_arr = dom.z
-            
-            # Build full 3D mesh
-            z_mesh, r_mesh, phi_mesh = np.meshgrid(
-                z_arr, r_arr, phi_arr, indexing='ij'
-            )
+            z_mesh, r_mesh, phi_mesh = np.meshgrid(z_arr, r_arr, phi_arr, indexing='ij')
             x = r_mesh * np.cos(phi_mesh)
             y = r_mesh * np.sin(phi_mesh)
             z = z_mesh
         else:
             raise ValueError(f"Unsupported coordinate system: {coords_system}")
-        
-        # Compute mask based on cut geometry
-        if len(cut) == 5:  # Cylinder
+
+        if len(cut) == 5:
             xc, yc, zc, rc, hc = cut
             r_xy = np.sqrt((x - xc)**2 + (y - yc)**2)
-            zmin, zmax = zc - hc/2, zc + hc/2
+            zmin, zmax = zc - hc / 2, zc + hc / 2
             mask_3d = (r_xy <= rc) & (z >= zmin) & (z <= zmax)
-        elif len(cut) == 4:  # Sphere
+        elif len(cut) == 4:
             xc, yc, zc, rs = cut
             r_sph = np.sqrt((x - xc)**2 + (y - yc)**2 + (z - zc)**2)
             mask_3d = r_sph <= rs
         else:
             raise ValueError("cut must have 4 (sphere) or 5 (cylinder) elements.")
-        
-        # Find bounding indices in each dimension where mask is True
-        # This preserves grid structure by using index ranges instead of boolean masks
-        
+
         if coords_system == 'spherical':
-            # Check which indices have any True values along other dimensions
-            mask_theta = np.any(mask_3d, axis=(1, 2))  # Any True along r, phi
-            mask_r = np.any(mask_3d, axis=(0, 2))      # Any True along theta, phi
-            mask_phi = np.any(mask_3d, axis=(0, 1))    # Any True along theta, r
-            
-            # Get index ranges
-            theta_idx = np.where(mask_theta)[0]
-            r_idx = np.where(mask_r)[0]
-            phi_idx = np.where(mask_phi)[0]
-            
+            theta_idx = np.where(np.any(mask_3d, axis=(1, 2)))[0]
+            r_idx = np.where(np.any(mask_3d, axis=(0, 2)))[0]
+            phi_idx = np.where(np.any(mask_3d, axis=(0, 1)))[0]
             if len(theta_idx) == 0 or len(r_idx) == 0 or len(phi_idx) == 0:
-                # Empty cut - return None
                 return None
-            
-            # Create slices with some padding to ensure we capture the cut region
-            # Use slice objects to maintain structure
-            result = {
+            return {
                 'theta_slice': slice(theta_idx[0], theta_idx[-1] + 1),
                 'r_slice': slice(r_idx[0], r_idx[-1] + 1),
                 'phi_slice': slice(phi_idx[0], phi_idx[-1] + 1),
-                'cut_mask': mask_3d,  # Store full mask for precise filtering if needed
-                'coords_system': 'spherical'
-            }
-            
-        elif coords_system == 'cylindrical':
-            # Check which indices have any True values
-            mask_z = np.any(mask_3d, axis=(1, 2))
-            mask_r = np.any(mask_3d, axis=(0, 2))
-            mask_phi = np.any(mask_3d, axis=(0, 1))
-            
-            z_idx = np.where(mask_z)[0]
-            r_idx = np.where(mask_r)[0]
-            phi_idx = np.where(mask_phi)[0]
-            
-            if len(z_idx) == 0 or len(r_idx) == 0 or len(phi_idx) == 0:
-                return None
-            
-            result = {
-                'z_slice': slice(z_idx[0], z_idx[-1] + 1),
-                'r_slice': slice(r_idx[0], r_idx[-1] + 1),
-                'phi_slice': slice(phi_idx[0], phi_idx[-1] + 1),
                 'cut_mask': mask_3d,
-                'coords_system': 'cylindrical'
+                'coords_system': 'spherical',
             }
-        
-        return result
+
+        z_idx = np.where(np.any(mask_3d, axis=(1, 2)))[0]
+        r_idx = np.where(np.any(mask_3d, axis=(0, 2)))[0]
+        phi_idx = np.where(np.any(mask_3d, axis=(0, 1)))[0]
+        if len(z_idx) == 0 or len(r_idx) == 0 or len(phi_idx) == 0:
+            return None
+        return {
+            'z_slice': slice(z_idx[0], z_idx[-1] + 1),
+            'r_slice': slice(r_idx[0], r_idx[-1] + 1),
+            'phi_slice': slice(phi_idx[0], phi_idx[-1] + 1),
+            'cut_mask': mask_3d,
+            'coords_system': 'cylindrical',
+        }
 
     def _detect_regular_grid(self, var1_mesh, var2_mesh, var3_mesh):
         """
@@ -890,13 +876,9 @@ class FieldInterpolator(fargopy.Fargobj):
 
         # Detect dimensionality from the sliced data (if a slice is provided)
         if slice is not None:
-            test_field = self.sim._load_field_raw('gasdens', snapshot=snapshots[0], field_type='scalar')
-            try:
-                data_slice, mesh = test_field.meshslice(slice=slice)
-                self.dim = len(np.array(data_slice).shape)
-            except Exception:
-                # Fallback: assume full 3D
-                self.dim = 3
+            slice_ranges = self._parse_slice_ranges(slice)
+            coords_system = self.sim.vars.COORDINATES if hasattr(self.sim, 'vars') else 'spherical'
+            self.dim = self._infer_slice_dim(coords_system, slice_ranges)
         else:
             self.dim = 3
 
@@ -934,116 +916,60 @@ class FieldInterpolator(fargopy.Fargobj):
         # =====================================================================
         if self.dim < 3:
 
-            # Collect rows and build DataFrame once to avoid repeated concat
+            def _assign_2d_coords(row, mesh):
+                if coords == 'cartesian':
+                    try:
+                        if hasattr(mesh, 'phi') and np.all(mesh.phi.ravel() == mesh.phi.ravel()[0]):
+                            phi0 = mesh.phi.ravel()[0]
+                            x_rot, y_rot, z_rot = _rotation(mesh.x, mesh.y, mesh.z, phi0)
+                            row['var1_mesh'] = x_rot
+                            row['var2_mesh'] = y_rot
+                            row['var3_mesh'] = z_rot
+                        else:
+                            row['var1_mesh'] = mesh.x
+                            row['var2_mesh'] = mesh.y
+                            row['var3_mesh'] = mesh.z
+                    except Exception:
+                        row['var1_mesh'] = mesh.x
+                        row['var2_mesh'] = mesh.y
+                        row['var3_mesh'] = mesh.z
+                else:
+                    vnames = getattr(self.sim.vars, 'VARIABLES', ['x', 'y', 'z'])
+                    row['var1_mesh'] = getattr(mesh, vnames[0])
+                    row['var2_mesh'] = getattr(mesh, vnames[1])
+                    row['var3_mesh'] = getattr(mesh, vnames[2])
+
             rows = []
 
             for i, snap in enumerate(snaps):
-
                 row = {'snapshot': snap, 'time': time_values[i]}
-                coords_assigned = False  # Only assign var1/var2/var3 once
+                coords_assigned = False
 
-                # Loop over requested fields
                 for field in fields:
+                    raw_field = self.sim._load_field_raw(field, snapshot=snap)
+                    self._field_types[field] = raw_field.type
 
-                    # -----------------
-                    # GASDENS 2D
-                    # -----------------
-                    if field == 'gasdens':
-                        gasd = self.sim._load_field_raw('gasdens', snapshot=snap, field_type='scalar')
-                        data_slice, mesh = gasd.meshslice(slice=slice)
+                    if raw_field.type == 'vector' and coords == 'cartesian' and raw_field.coordinates != 'cartesian':
+                        converted = raw_field.to_cartesian()
+                        if not isinstance(converted, tuple):
+                            converted = (converted,)
+                        component_slices = []
+                        mesh = None
+                        for component in converted:
+                            comp_slice, comp_mesh = component.meshslice(slice=slice)
+                            component_slices.append(comp_slice)
+                            if mesh is None:
+                                mesh = comp_mesh
+                        data_slice = np.array(component_slices)
+                    else:
+                        data_slice, mesh = raw_field.meshslice(slice=slice)
 
-                        # assign coordinates only once
-                        if not coords_assigned:
-                            if coords == 'cartesian':
-                                # rotate if phi is fixed
-                                try:
-                                    if np.all(mesh.phi.ravel() == mesh.phi.ravel()[0]):
-                                        phi0 = mesh.phi.ravel()[0]
-                                        x_rot, y_rot, z_rot = _rotation(mesh.x, mesh.y, mesh.z, phi0)
-                                        row['var1_mesh'] = x_rot
-                                        row['var2_mesh'] = y_rot
-                                        row['var3_mesh'] = z_rot
-                                    else:
-                                        row['var1_mesh'] = mesh.x
-                                        row['var2_mesh'] = mesh.y
-                                        row['var3_mesh'] = mesh.z
-                                except Exception:
-                                    # Fallback if mesh lacks phi
-                                    row['var1_mesh'] = mesh.x
-                                    row['var2_mesh'] = mesh.y
-                                    row['var3_mesh'] = mesh.z
-                            else:
-                                # original coordinate names as defined in simulation
-                                vnames = getattr(self.sim.vars, 'VARIABLES', ['x', 'y', 'z'])
-                                row['var1_mesh'] = getattr(mesh, vnames[0])
-                                row['var2_mesh'] = getattr(mesh, vnames[1])
-                                row['var3_mesh'] = getattr(mesh, vnames[2])
-                            coords_assigned = True
+                    if not coords_assigned:
+                        _assign_2d_coords(row, mesh)
+                        coords_assigned = True
 
-                        row['gasdens_mesh'] = data_slice
+                    row[f'{field}_mesh'] = data_slice
 
-                    # -----------------
-                    # GASV 2D
-                    # -----------------
-                    if field == 'gasv':
-                        gasv_raw = self.sim._load_field_raw('gasv', snapshot=snap, field_type='vector')
-                        if coords == 'cartesian':
-                            gasvx, gasvy, gasvz = gasv_raw.to_cartesian()
-                            v1, mesh = gasvx.meshslice(slice=slice)
-                            v2, mesh = gasvy.meshslice(slice=slice)
-                            v3, mesh = gasvz.meshslice(slice=slice)
-
-                            if not coords_assigned:
-                                row['var1_mesh'] = mesh.x
-                                row['var2_mesh'] = mesh.y
-                                row['var3_mesh'] = mesh.z
-                                coords_assigned = True
-
-                            row['gasv_mesh'] = np.array([v1, v2, v3])
-                        else:
-                            v_slice, mesh = gasv_raw.meshslice(slice=slice)
-                            # Handle 2D (2 components) or 3D (3 components)
-                            ncomponents = len(v_slice)
-                            if ncomponents == 2:
-                                v1, v2 = v_slice[0], v_slice[1]
-                                if not coords_assigned:
-                                    vnames = getattr(self.sim.vars, 'VARIABLES', ['x', 'y', 'z'])
-                                    row['var1_mesh'] = getattr(mesh, vnames[0])
-                                    row['var2_mesh'] = getattr(mesh, vnames[1])
-                                    coords_assigned = True
-                                row['gasv_mesh'] = np.array([v1, v2])
-                            else:  # 3D
-                                v1, v2, v3 = v_slice[0], v_slice[1], v_slice[2]
-                                if not coords_assigned:
-                                    vnames = getattr(self.sim.vars, 'VARIABLES', ['x', 'y', 'z'])
-                                    row['var1_mesh'] = getattr(mesh, vnames[0])
-                                    row['var2_mesh'] = getattr(mesh, vnames[1])
-                                    row['var3_mesh'] = getattr(mesh, vnames[2])
-                                    coords_assigned = True
-                                row['gasv_mesh'] = np.array([v1, v2, v3])
-
-                    # -----------------
-                    # GASENERGY 2D
-                    # -----------------
-                    if field == 'gasenergy':
-                        gasen = self.sim._load_field_raw('gasenergy', snapshot=snap, field_type='scalar')
-                        data_slice, mesh = gasen.meshslice(slice=slice)
-
-                        if not coords_assigned:
-                            if coords == 'cartesian':
-                                row['var1_mesh'] = mesh.x
-                                row['var2_mesh'] = mesh.y
-                                row['var3_mesh'] = mesh.z
-                            else:
-                                vnames = getattr(self.sim.vars, 'VARIABLES', ['x', 'y', 'z'])
-                                row['var1_mesh'] = getattr(mesh, vnames[0])
-                                row['var2_mesh'] = getattr(mesh, vnames[1])
-                                row['var3_mesh'] = getattr(mesh, vnames[2])
-                            coords_assigned = True
-
-                        row['gasenergy_mesh'] = data_slice
-
-                # collect row dicts and build DataFrame once
                 rows.append(row)
 
             df_snapshots = pd.DataFrame(rows)
@@ -1119,141 +1045,45 @@ class FieldInterpolator(fargopy.Fargobj):
                 row = {'snapshot': snap, 'time': time_values[i]}
                 coords_assigned = False
 
-                # Loop over requested fields
+                def _assign_3d_coords():
+                    if coords == 'cartesian':
+                        row["var1_mesh"] = x
+                        row["var2_mesh"] = y
+                        row["var3_mesh"] = z
+                    else:
+                        v0, v1, v2 = self.sim.vars.VARIABLES
+                        mapping = dict(r=r, phi=phi, theta=theta, x=x, y=y, z=z)
+                        row["var1_mesh"] = mapping[v0]
+                        row["var2_mesh"] = mapping[v1]
+                        row["var3_mesh"] = mapping[v2]
+
+                def _apply_cut(data, field_type):
+                    if cut_info is None:
+                        return data
+                    if coords_sys == 'spherical':
+                        slices = (cut_info['theta_slice'], cut_info['r_slice'], cut_info['phi_slice'])
+                    else:
+                        slices = (cut_info['z_slice'], cut_info['r_slice'], cut_info['phi_slice'])
+                    if field_type == 'vector':
+                        return np.array([component[slices] for component in data])
+                    return data[slices]
+
                 for field in fields:
+                    raw_field = self.sim._load_field_raw(field, snapshot=snap)
+                    self._field_types[field] = raw_field.type
 
-                    # -----------------
-                    # GASDENS 3D
-                    # -----------------
-                    if field == "gasdens":
-                        gasd = self.sim._load_field_raw('gasdens', snapshot=snap, field_type='scalar')
+                    field_data = raw_field.data
+                    if raw_field.type == 'vector' and coords == 'cartesian' and raw_field.coordinates != 'cartesian':
+                        converted = raw_field.to_cartesian()
+                        if not isinstance(converted, tuple):
+                            converted = (converted,)
+                        field_data = np.array([component.data for component in converted])
 
-                        if not coords_assigned:
-                            if coords == 'cartesian':
-                                row["var1_mesh"] = x
-                                row["var2_mesh"] = y
-                                row["var3_mesh"] = z
-                            else:
-                                # original coordinate variables order
-                                v0, v1, v2 = self.sim.vars.VARIABLES
-                                mapping = dict(r=r, phi=phi, theta=theta, x=x, y=y, z=z)
-                                row["var1_mesh"] = mapping[v0]
-                                row["var2_mesh"] = mapping[v1]
-                                row["var3_mesh"] = mapping[v2]
-                            coords_assigned = True
+                    if not coords_assigned:
+                        _assign_3d_coords()
+                        coords_assigned = True
 
-                        # Apply structured slicing to data
-                        if cut_info is not None:
-                            if coords_sys == 'spherical':
-                                data_sliced = gasd.data[
-                                    cut_info['theta_slice'],
-                                    cut_info['r_slice'],
-                                    cut_info['phi_slice']
-                                ]
-                            else:  # cylindrical
-                                data_sliced = gasd.data[
-                                    cut_info['z_slice'],
-                                    cut_info['r_slice'],
-                                    cut_info['phi_slice']
-                                ]
-                            row["gasdens_mesh"] = data_sliced
-                        else:
-                            row["gasdens_mesh"] = gasd.data
-                            
-                    # -----------------
-                    # GASV 3D
-                    # -----------------
-                    if field == "gasv":
-                        gasv_raw = self.sim._load_field_raw('gasv', snapshot=snap, field_type='vector')
-                        
-                        if coords == 'cartesian':
-                            gasvx, gasvy, gasvz = gasv_raw.to_cartesian()
-
-                            if not coords_assigned:
-                                row["var1_mesh"] = x
-                                row["var2_mesh"] = y
-                                row["var3_mesh"] = z
-                                coords_assigned = True
-
-                            # Apply structured slicing to vector components
-                            if cut_info is not None:
-                                if coords_sys == 'spherical':
-                                    row["gasv_mesh"] = np.array([
-                                        gasvx.data[cut_info['theta_slice'], cut_info['r_slice'], cut_info['phi_slice']],
-                                        gasvy.data[cut_info['theta_slice'], cut_info['r_slice'], cut_info['phi_slice']],
-                                        gasvz.data[cut_info['theta_slice'], cut_info['r_slice'], cut_info['phi_slice']]
-                                    ])
-                                else:  # cylindrical
-                                    row["gasv_mesh"] = np.array([
-                                        gasvx.data[cut_info['z_slice'], cut_info['r_slice'], cut_info['phi_slice']],
-                                        gasvy.data[cut_info['z_slice'], cut_info['r_slice'], cut_info['phi_slice']],
-                                        gasvz.data[cut_info['z_slice'], cut_info['r_slice'], cut_info['phi_slice']]
-                                    ])
-                            else:
-                                row["gasv_mesh"] = np.array([gasvx.data, gasvy.data, gasvz.data])
-                        else:
-                            vdata = gasv_raw.data
-                            if not coords_assigned:
-                                v0, v1, v2 = self.sim.vars.VARIABLES
-                                mapping = dict(r=r, phi=phi, theta=theta, x=x, y=y, z=z)
-                                row["var1_mesh"] = mapping[v0]
-                                row["var2_mesh"] = mapping[v1]
-                                row["var3_mesh"] = mapping[v2]
-                                coords_assigned = True
-
-                            # Apply structured slicing to vector components
-                            if cut_info is not None:
-                                if coords_sys == 'spherical':
-                                    row["gasv_mesh"] = np.array([
-                                        vdata[0][cut_info['theta_slice'], cut_info['r_slice'], cut_info['phi_slice']],
-                                        vdata[1][cut_info['theta_slice'], cut_info['r_slice'], cut_info['phi_slice']],
-                                        vdata[2][cut_info['theta_slice'], cut_info['r_slice'], cut_info['phi_slice']]
-                                    ])
-                                else:  # cylindrical
-                                    row["gasv_mesh"] = np.array([
-                                        vdata[0][cut_info['z_slice'], cut_info['r_slice'], cut_info['phi_slice']],
-                                        vdata[1][cut_info['z_slice'], cut_info['r_slice'], cut_info['phi_slice']],
-                                        vdata[2][cut_info['z_slice'], cut_info['r_slice'], cut_info['phi_slice']]
-                                    ])
-                            else:
-                                row["gasv_mesh"] = np.array([vdata[0], vdata[1], vdata[2]])
-
-                    # -----------------
-                    # GASENERGY 3D
-                    # -----------------
-                    if field == "gasenergy":
-                        gasen = self.sim._load_field_raw('gasenergy', snapshot=snap, field_type='scalar')
-
-                        if not coords_assigned:
-                            if coords == 'cartesian':
-                                row["var1_mesh"] = x
-                                row["var2_mesh"] = y
-                                row["var3_mesh"] = z
-                            else:
-                                v0, v1, v2 = self.sim.vars.VARIABLES
-                                mapping = dict(r=r, phi=phi, theta=theta, x=x, y=y, z=z)
-                                row["var1_mesh"] = mapping[v0]
-                                row["var2_mesh"] = mapping[v1]
-                                row["var3_mesh"] = mapping[v2]
-                            coords_assigned = True
-
-                        # Apply structured slicing to data
-                        if cut_info is not None:
-                            if coords_sys == 'spherical':
-                                data_sliced = gasen.data[
-                                    cut_info['theta_slice'],
-                                    cut_info['r_slice'],
-                                    cut_info['phi_slice']
-                                ]
-                            else:  # cylindrical
-                                data_sliced = gasen.data[
-                                    cut_info['z_slice'],
-                                    cut_info['r_slice'],
-                                    cut_info['phi_slice']
-                                ]
-                            row["gasenergy_mesh"] = data_sliced
-                        else:
-                            row["gasenergy_mesh"] = gasen.data
+                    row[f"{field}_mesh"] = _apply_cut(field_data, raw_field.type)
 
                 # collect row dicts and build DataFrame once
                 rows.append(row)
@@ -1830,31 +1660,26 @@ class FieldInterpolator(fargopy.Fargobj):
         # ===============================================================
         # FIELD SELECTION (safe and explicit)
         # ===============================================================
-        field_map = {
-            "gasdens": "gasdens_mesh",
-            "gasv": "gasv_mesh",
-            "gasenergy": "gasenergy_mesh"
-        }
-
+        mesh_columns = [
+            c for c in df.columns
+            if c.endswith("_mesh") and c not in ("var1_mesh", "var2_mesh", "var3_mesh")
+        ]
         if field is not None:
-            if field in field_map:
-                field = field_map[field]
-            if field not in df.columns:
+            field_col = field if field.endswith("_mesh") else f"{field}_mesh"
+            if field_col not in df.columns:
                 raise ValueError(
-                    f"Field '{field}' not in DF. Available: {list(df.columns)}"
+                    f"Field '{field}' not in DF. Available: {mesh_columns}"
                 )
         else:
-            # Autodetect only if exactly one exists
-            candidates = [
-                c for c in df.columns
-                if c in ("gasdens_mesh","gasv_mesh","gasenergy_mesh")
-            ]
+            candidates = mesh_columns
             if len(candidates) != 1:
                 raise ValueError(
-                    f"Multiple fields present {candidates}. "
-                    "Specify field='gasdens', 'gasv', or 'gasenergy'."
+                    f"Multiple fields present {candidates}. Specify the field explicitly."
                 )
-            field = candidates[0]
+            field_col = candidates[0]
+
+        field_name = field_col[:-5] if field_col.endswith("_mesh") else field_col
+        field_type = getattr(self, "_field_types", {}).get(field_name)
 
         # ===============================================================
         # Prepare snapshot ordering
@@ -1874,6 +1699,14 @@ class FieldInterpolator(fargopy.Fargobj):
         if np.isscalar(var1): var1 = np.array([var1])
         if np.isscalar(var2): var2 = np.array([var2])
         if np.isscalar(var3): var3 = np.array([var3])
+
+        # 3D queries sometimes omit one or two coordinates because the slice is
+        # already fixed by load_field(). Default missing axes to the midplane.
+        if self.dim == 3:
+            if var2 is None:
+                var2 = np.zeros_like(var1)
+            if var3 is None:
+                var3 = np.zeros_like(var1)
 
         # Convenience: allow calling evaluate(var1=..., var2=...) for
         # 2D XZ or RZ slices where the expected coordinates are (var1,var3).
@@ -1910,7 +1743,7 @@ class FieldInterpolator(fargopy.Fargobj):
                 return values
 
             # Vector smoothing
-            if field == "gasv_mesh" and arr.ndim >= 2:
+            if field_type == "vector" and arr.ndim >= 2:
                 out = np.empty_like(arr)
                 for k in range(arr.shape[0]):
                     out[k] = gaussian_filter(arr[k], sigma=sigma_smooth)
@@ -2218,7 +2051,7 @@ class FieldInterpolator(fargopy.Fargobj):
                 
                 if use_regular_grid:
                     # Select field data
-                    data_3d = row[field_name]
+                    data_3d = row[field_col]
                     
                     # Handle vector component selection before interpolation
                     if isinstance(data_3d, np.ndarray) and comp is not None:
@@ -2299,7 +2132,7 @@ class FieldInterpolator(fargopy.Fargobj):
                                 
                                 if result_reflected is not None:
                                     # Apply sign flip for perpendicular component
-                                    if field_name == 'gasv_mesh' and comp == 2:
+                                    if field_type == 'vector' and comp == 2:
                                         result_reflected = result_reflected * (-1)
                                     
                                     # Identify NaN values in primary interpolation
@@ -2378,7 +2211,7 @@ class FieldInterpolator(fargopy.Fargobj):
                 xi = np.asarray(var1_use)
 
             # Select field
-            data = row[field_name]
+            data = row[field_col]
 
             # -------------------------------------------
             # UNIVERSAL VECTOR COMPONENT SELECTOR
@@ -2459,7 +2292,7 @@ class FieldInterpolator(fargopy.Fargobj):
 
                     # For vector components, reflect sign for the component
                     # perpendicular to the reflection plane
-                    if field_name == 'gasv_mesh' and comp is not None:
+                    if field_type == 'vector' and comp is not None:
                         # The perpendicular component depends on the coordinate system:
                         # - Cartesian: vz (comp=2)
                         # - Spherical: v_theta (comp=2)
@@ -2496,7 +2329,7 @@ class FieldInterpolator(fargopy.Fargobj):
         # TIME INTERPOLATION
         # ===============================================================
         if nsnaps == 1:
-            if field == "gasv_mesh":
+            if field_type == "vector":
                 vals = [interp(0, field, c) for c in range(3)]
                 arr = np.array([v.item() if is_scalar else v.reshape(result_shape) for v in vals])
                 return _smooth(arr)
@@ -2515,7 +2348,7 @@ class FieldInterpolator(fargopy.Fargobj):
                 v1 = interp(i1, field, c)
                 return (1 - fac) * v0 + fac * v1
 
-            if field == "gasv_mesh":
+            if field_type == "vector":
                 vals = [blend(c) for c in range(3)]
                 arr = np.array([v.item() if is_scalar else v.reshape(result_shape) for v in vals])
                 return _smooth(arr)
@@ -2536,7 +2369,7 @@ class FieldInterpolator(fargopy.Fargobj):
             v1 = interp(i1, field, c)
             return (1 - fac) * v0 + fac * v1
 
-        if field == "gasv_mesh":
+        if field_type == "vector":
             vals = [blend(c) for c in range(3)]
             arr = np.array([v.item() if is_scalar else v.reshape(result_shape) for v in vals])
             return _smooth(arr)
@@ -2574,47 +2407,33 @@ class FieldInterpolator(fargopy.Fargobj):
             comp = 0   
         df_names = self.df.columns.tolist()
 
-        # Map short names to dataframe column names
-        field_map = {
-            'gasdens': 'gasdens_mesh',
-            'gasv': 'gasv_mesh',
-            'gasenergy': 'gasenergy_mesh'
-        }
-
-        # Detect candidate fields present in the DataFrame
-        candidates = [c for c in df_names if c in ('gasdens_mesh', 'gasv_mesh', 'gasenergy_mesh')]
-
-        # Resolve user-requested field
         if field is not None:
-            # allow short names or full column names
-            if field in field_map:
-                field_col = field_map[field]
-            else:
-                field_col = field
+            field_col = field if field.endswith('_mesh') else f'{field}_mesh'
             if field_col not in df_names:
-                raise ValueError(f"Requested field '{field}' not present. Available: {candidates}")
+                raise ValueError(f"Requested field '{field}' not present. Available: {[c for c in df_names if c.endswith('_mesh')]}")
         else:
+            candidates = [c for c in df_names if c.endswith('_mesh')]
             if len(candidates) == 1:
                 field_col = candidates[0]
             else:
                 raise ValueError(
-                    f"Multiple fields present {candidates}. Specify which to plot using field='gasdens' or 'gasv'."
+                    f"Multiple fields present {candidates}. Specify which to plot using field='<name>'."
                 )
+
+        field_name = field_col[:-5] if field_col.endswith('_mesh') else field_col
+        field_type = getattr(self, '_field_types', {}).get(field_name)
 
         # Extract the mesh grids and field data after slicing
         var1 = self.df['var1_mesh'][t]
         var2 = self.df['var2_mesh'][t]
         var3 = self.df['var3_mesh'][t]
 
-        # Load the original field (before slicing) if needed elsewhere
-        d3 = self.sim._load_field_raw('gasdens', snapshot=int(self.df['snapshot'][t]), field_type='scalar')
-
         # Prepare field_data according to selected field
         raw_field = self.df[field_col][t]
-        is_vector = (field_col == 'gasv_mesh')
+        data_arr = np.asarray(raw_field)
+        is_vector = field_type == 'vector' or (field_type is None and data_arr.ndim >= 2 and data_arr.shape[0] in (2, 3))
         if is_vector:
             # choose component or compute magnitude if needed
-            data_arr = np.asarray(raw_field)
             # handle common memory layouts: (3, ... ) or (..., 3)
             if data_arr.ndim >= 1 and data_arr.shape[0] == 3:
                 # shape (3, N...) -> select component

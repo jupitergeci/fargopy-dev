@@ -622,31 +622,9 @@ class FieldsHandler(Fargobj):
         loaded_fields = []
 
         for field in self.fields:
-            # Infer field type unless provided
-            field_type = self.type
-            if field_type is None:
-                if field in ["gasdens", "gasenergy"]:
-                    field_type = "scalar"
-                elif field == "gasv":
-                    field_type = "vector"
-                else:
-                    raise ValueError(f"Field type for '{field}' could not be inferred.")
-
-            # Load scalar
-            if field_type == "scalar":
-                file_name = f"{field}{snapshot}.dat"
-                file_field = os.path.join(self.sim.output_dir, file_name)
-                data = self.sim._load_field_scalar(file_field)
-
-            # Load vector
-            elif field_type == "vector":
-                data = []
-                components = ["x", "y"] + (["z"] if self.sim.vars.DIM == 3 else [])
-                for comp in components:
-                    file_name = f"{field}{comp}{snapshot}.dat"
-                    file_field = os.path.join(self.sim.output_dir, file_name)
-                    data.append(self.sim._load_field_scalar(file_field))
-                data = np.array(data)
+            # Infer field type unless provided, then delegate to Simulation.
+            field_type = self.type or self.sim._infer_field_type(field, snapshot=snapshot)
+            data = self.sim._load_field_raw(field, snapshot=snapshot, field_type=field_type).data
 
             # Create Field
             loaded_field = fargopy.Field(

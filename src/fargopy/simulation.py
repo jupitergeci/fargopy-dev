@@ -1495,6 +1495,65 @@ class Simulation(fargopy.Fargobj):
         else:
             raise AssertionError(f"File with field '{file}' not found")
 
+    def available_fields(self, snapshot=0):
+        """Return the field names detected in the output directory for a snapshot.
+
+        Scalar fields are files named ``<field><snapshot>.dat``. Vector fields are
+        detected when the matching ``x``/``y`` components exist and, for 3D
+        simulations, the ``z`` component also exists.
+        """
+        if not hasattr(self, "output_dir") or self.output_dir is None:
+            return {}
+        if not os.path.isdir(self.output_dir):
+            return {}
+
+        snapshot = int(snapshot)
+        suffix = f"{snapshot}.dat"
+        candidates = [name for name in os.listdir(self.output_dir) if name.endswith(suffix)]
+
+        grouped = {}
+        for name in candidates:
+            stem = name[: -len(suffix)]
+            if stem and stem[-1] in ("x", "y", "z"):
+                base = stem[:-1]
+                grouped.setdefault(base, set()).add(stem[-1])
+            else:
+                grouped.setdefault(stem, set()).add("")
+
+        detected = {}
+        expected_components = ["x", "y"] + (["z"] if getattr(self.vars, "DIM", 3) == 3 else [])
+        for field, components in grouped.items():
+            if not field:
+                continue
+            scalar_file = f"{field}{suffix}"
+            if "" in components and scalar_file in candidates:
+                detected[field] = "scalar"
+                continue
+
+            component_files = [f"{field}{comp}{suffix}" for comp in expected_components]
+            if all(component in candidates for component in component_files):
+                detected[field] = "vector"
+
+        return detected
+
+    def _infer_field_type(self, field, snapshot=0):
+        """Infer the field type from the files present in the output directory."""
+        snapshot = int(snapshot)
+        detected = self.available_fields(snapshot=snapshot)
+        if field in detected:
+            return detected[field]
+
+        scalar_file = os.path.join(self.output_dir, f"{field}{snapshot}.dat")
+        if os.path.isfile(scalar_file):
+            return "scalar"
+
+        components = ["x", "y"] + (["z"] if getattr(self.vars, "DIM", 3) == 3 else [])
+        vector_files = [os.path.join(self.output_dir, f"{field}{comp}{snapshot}.dat") for comp in components]
+        if all(os.path.isfile(component) for component in vector_files):
+            return "vector"
+
+        raise ValueError(f"Field type for '{field}' could not be inferred from output files.")
+
     def _load_field_raw(self, field, snapshot=0, field_type=None):
         """
         Internal helper to load a single field as a `fargopy.Field` without going
@@ -1503,12 +1562,7 @@ class Simulation(fargopy.Fargobj):
         """
         # Infer type if not provided
         if field_type is None:
-            if field in ["gasdens", "gasenergy"]:
-                field_type = "scalar"
-            elif field == "gasv":
-                field_type = "vector"
-            else:
-                raise ValueError(f"Field type for '{field}' could not be inferred.")
+            field_type = self._infer_field_type(field, snapshot=snapshot)
 
         # Load scalar
         if field_type == "scalar":
@@ -1831,12 +1885,7 @@ class Simulation(fargopy.Fargobj):
             base = getattr(self, "setup", "simulation")
             basename = f"{base}_snap{snapshot}"
 
-        filename = os.path.join(dir, basename)
-
-        # Load fields (tolerant to different return types)
-        gasdens = self._load_field_raw(
-            field="gasdens", snapshot=snapshot, field_type="scalar"
-        )
+        gasdens = self._load_field_raw(field="gasdens", snapshot=snapshot, field_type="scalar")
         gasv = self._load_field_raw(field="gasv", snapshot=snapshot, field_type="vector")
 
         rho = np.log10(

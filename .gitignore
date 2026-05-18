@@ -169,4 +169,7 @@ contrib/
 
 # Test data
 src/fargopy/tests/data/
+fargopy-env/
+.gitignore
+p1.ipynb
 
