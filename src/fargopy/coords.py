@@ -136,6 +136,52 @@ def _cylindrical_to_cartesian(phi, r, z=None):
         return x, y, z
 
 
+def _polar_to_cartesian(phi, r):
+    """
+    Convert 2D polar coordinates to Cartesian coordinates.
+
+    Parameters
+    ----------
+    phi : float or array_like
+        Azimuthal angle in radians.
+    r : float or array_like
+        Radial distance.
+
+    Returns
+    -------
+    x : float or array_like
+        Cartesian x-coordinate.
+    y : float or array_like
+        Cartesian y-coordinate.
+    """
+    x = r * np.cos(phi)
+    y = r * np.sin(phi)
+    return x, y
+
+
+def _cartesian_to_polar(x, y):
+    """
+    Convert Cartesian coordinates to 2D polar coordinates.
+
+    Parameters
+    ----------
+    x : float or array_like
+        Cartesian x-coordinate.
+    y : float or array_like
+        Cartesian y-coordinate.
+
+    Returns
+    -------
+    phi : float or array_like
+        Azimuthal angle in radians.
+    r : float or array_like
+        Radial distance.
+    """
+    r = np.sqrt(x**2 + y**2)
+    phi = np.arctan2(y, x)
+    return phi, r
+
+
 def _cartesian_to_spherical(x, y, z):
     """
     Convert Cartesian coordinates to spherical coordinates.

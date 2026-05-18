@@ -591,13 +591,25 @@ class FieldsHandler(Fargobj):
                 "Please save with save_object_pkl() instead and reload."
             )
 
+        coords = getattr(self, "coords", None)
+        if hasattr(self.sim, "vars") and getattr(self.sim.vars, "DIM", 3) == 2:
+            if coords in ("spherical", "cylindrical"):
+                warnings.warn(
+                    "2D simulations are loaded in polar coordinates; falling back to 'polar' instead of a 3D coordinate system.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                coords = "polar"
+            elif coords is None:
+                coords = "polar"
+
         handler = fargopy.FieldInterpolator(self.sim)
         handler.load_data(
             fields=self.fields,
             slice=self.slice,
             snapshots=self.snapshot,
             cut=self.cut,
-            coords=self.coords,
+            coords=coords,
         )
         return handler
 
