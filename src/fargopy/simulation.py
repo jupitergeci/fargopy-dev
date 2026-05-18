@@ -10,6 +10,7 @@ import os
 import json
 import numpy as np
 import re
+import warnings
 import subprocess
 import time
 import gdown
@@ -1314,7 +1315,16 @@ class Simulation(fargopy.Fargobj):
 
         # Create additional variables
         variables = ["x", "y", "z"]
-        if vars.COORDINATES == "cylindrical":
+        vars.DIM = 2 if int(getattr(vars, "NZ", 1)) == 1 else 3
+        if vars.DIM == 2:
+            warnings.warn(
+                "Detected a 2D simulation. FARGOpy will expose it as a native polar plane (phi, r).",
+                UserWarning,
+                stacklevel=2,
+            )
+            vars.COORDINATES = "polar"
+            variables = ["phi", "r", "z"]
+        elif vars.COORDINATES == "cylindrical":
             variables = ["phi", "r", "z"]
         elif vars.COORDINATES == "spherical":
             variables = ["phi", "r", "theta"]
@@ -1323,9 +1333,6 @@ class Simulation(fargopy.Fargobj):
         vars.__dict__[f"N{variables[0].upper()}"] = vars.NX
         vars.__dict__[f"N{variables[1].upper()}"] = vars.NY
         vars.__dict__[f"N{variables[2].upper()}"] = vars.NZ
-
-        # Dimension of the domain
-        vars.DIM = 2 if vars.NZ == 1 else 3
 
         return vars
 
@@ -1359,6 +1366,15 @@ class Simulation(fargopy.Fargobj):
         if vars.DIM == 2:
             borders[-1] = []
 
+        if vars.DIM == 2:
+            variable_names = ["phi", "r", "z"]
+        elif vars.COORDINATES == "cylindrical":
+            variable_names = ["phi", "r", "z"]
+        elif vars.COORDINATES == "spherical":
+            variable_names = ["phi", "r", "theta"]
+        else:
+            variable_names = ["x", "y", "z"]
+
         # Load domains
         domains = dict()
         domains["extrema"] = dict()
@@ -1367,33 +1383,53 @@ class Simulation(fargopy.Fargobj):
             domain_file = os.path.join(
                 self.output_dir, f"{domain_prefix}{variable_suffix}.dat"
             )
+            if vars.DIM == 2 and i == 2:
+                domains[variable_names[i]] = np.array([0.0])
+                domains["extrema"][variable_names[i]] = [[0, 0.0], [-1, 0.0]]
+                print(f"\tVariable {variable_names[i]}: 1 {domains['extrema'][variable_names[i]]}")
+                continue
+
             if os.path.isfile(domain_file):
                 # Load data from file
-                domains[vars.VARIABLES[i]] = np.genfromtxt(domain_file)
+                domains[variable_names[i]] = np.genfromtxt(domain_file)
 
                 if len(borders[i]) > 0:
                     # Drop the border of the domain
-                    domains[vars.VARIABLES[i]] = domains[vars.VARIABLES[i]][
+                    domains[variable_names[i]] = domains[variable_names[i]][
                         borders[i][0] : borders[i][1]
                     ]
 
-                if middle:
+                if middle and len(domains[variable_names[i]]) > 1:
                     # Average between domain cell coordinates
-                    domains[vars.VARIABLES[i]] = 0.5 * (
-                        domains[vars.VARIABLES[i]][:-1] + domains[vars.VARIABLES[i]][1:]
+                    domains[variable_names[i]] = 0.5 * (
+                        domains[variable_names[i]][:-1] + domains[variable_names[i]][1:]
                     )
 
                 # Show indices and value map
-                domains["extrema"][vars.VARIABLES[i]] = [
-                    [0, domains[vars.VARIABLES[i]][0]],
-                    [-1, domains[vars.VARIABLES[i]][-1]],
+                domains["extrema"][variable_names[i]] = [
+                    [0, domains[variable_names[i]][0]],
+                    [-1, domains[variable_names[i]][-1]],
                 ]
 
+                if vars.DIM == 2 and i == 0:
+                    domains["x"] = domains["phi"]
+                if vars.DIM == 2 and i == 1:
+                    domains["y"] = domains["r"]
+
                 print(
-                    f"\tVariable {vars.VARIABLES[i]}: {len(domains[vars.VARIABLES[i]])} {domains['extrema'][vars.VARIABLES[i]]}"
+                    f"\tVariable {variable_names[i]}: {len(domains[variable_names[i]])} {domains['extrema'][variable_names[i]]}"
                 )
             else:
                 print(f"\tDomain file {domain_file} not found.")
+                if vars.DIM == 2 and i == 2:
+                    domains[variable_names[i]] = np.array([0.0])
+                    domains["extrema"][variable_names[i]] = [[0, 0.0], [-1, 0.0]]
+                    print(f"\tVariable {variable_names[i]}: 1 {domains['extrema'][variable_names[i]]}")
+
+        if vars.DIM == 2:
+            domains["x"] = domains.get("phi", domains.get("x"))
+            domains["y"] = domains.get("r", domains.get("y"))
+            domains["z"] = domains.get("z", np.array([0.0]))
         domains = fargopy.Dictobj(dict=domains)
 
         return domains
@@ -1582,8 +1618,12 @@ class Simulation(fargopy.Fargobj):
                 data.append(self._load_field_scalar(file_field))
             data = np.array(data)
 
+        data = np.array(data)
+        if getattr(self.vars, "DIM", 3) == 2:
+            data = np.squeeze(data)
+
         return fargopy.Field(
-            data=np.array(data),
+            data=data,
             coordinates=self.vars.COORDINATES,
             domains=self.domains,
             type=field_type,
