@@ -1645,14 +1645,14 @@ class PlotInteractiveWindow(QWidget):
 
     def build_slice_str(self):
         if self._is_polar_2d():
-            return self._manual_polar_slice_str()
+            return self._manual_polar_slice_str() or None
         # If the user edited any field manually SINCE the last update, ignore last_slice_str
         if getattr(self, "_fields_edited", False):
-            return self._manual_slice_str()
+            return self._manual_slice_str() or None
         # Otherwise, use the zoom slice if present
         if self.last_slice_str:
             return self.last_slice_str
-        return self._manual_slice_str()
+        return self._manual_slice_str() or None
 
     def _manual_polar_slice_str(self):
         def norm(txt):
@@ -1809,6 +1809,8 @@ class PlotInteractiveWindow(QWidget):
 
         # Determine axes and mesh names based on fixed coordinates (same logic as plot_density)
         def is_fixed(var, slice_str):
+            if not slice_str:
+                return False
             # Match both single values (var=X) and ranges with equal values (var=[X,X])
             slice_clean = slice_str.replace(' ', '')
             single_match = re.search(rf'{var}=([^\[\],]+)', slice_clean)
