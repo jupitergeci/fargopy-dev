@@ -19,6 +19,8 @@ from matplotlib.animation import FFMpegWriter
 import os
 import re
 import subprocess
+import traceback
+from datetime import datetime
 
 CMAP_GROUPS = [
     ('Perc Unif Sequ', [
@@ -278,18 +280,28 @@ class SimInfoDialog(QDialog):
             except Exception:
                 domain_info += "r domain: not available\n"
             
-            # Try theta (spherical) or z (cylindrical)
-            try:
-                thetamin = self.sim.domains.theta.min()
-                thetamax = self.sim.domains.theta.max()
-                domain_info += f"theta domain: [{thetamin:.3g}, {thetamax:.3g}]\n"
-            except Exception:
+            # Try theta (spherical) or z (cylindrical); polar 2D has no theta/z axis
+            if self._is_polar_2d():
+                domain_info += "polar plane: [phi, r]\n"
+            else:
+                theta_domain = getattr(self.sim.domains, 'theta', None)
+                if theta_domain is not None:
+                    thetamin = theta_domain.min()
+                    thetamax = theta_domain.max()
+                    domain_info += f"theta domain: [{thetamin:.3g}, {thetamax:.3g}]\n"
+                else:
+                    try:
+                        zmin = self.sim.domains.z.min()
+                        zmax = self.sim.domains.z.max()
+                        domain_info += f"z domain: [{zmin:.3g}, {zmax:.3g}]\n"
+                    except Exception:
+                        domain_info += "theta/z domain: not available\n"
+
+            if not self._is_polar_2d():
                 try:
-                    zmin = self.sim.domains.z.min()
-                    zmax = self.sim.domains.z.max()
-                    domain_info += f"z domain: [{zmin:.3g}, {zmax:.3g}]\n"
+                    pass
                 except Exception:
-                    domain_info += "theta/z domain: not available\n"
+                    pass
             
             try:
                 phimin = self.sim.domains.phi.min()
@@ -706,6 +718,84 @@ class PlotInteractiveWindow(QWidget):
         self.slice_type = "theta"
         self.last_slice_str = ""
 
+    def _is_polar_2d(self):
+        return bool(
+            self.sim
+            and getattr(self.sim.vars, 'DIM', 3) == 2
+            and getattr(self.sim.vars, 'COORDINATES', '').lower() == 'polar'
+        )
+
+    def _append_log(self, message, level="info"):
+        stamp = datetime.now().strftime("%H:%M:%S")
+        text = f"[{stamp}] {message}"
+        if hasattr(self, 'log_text'):
+            color = {'error': '#ff6b6b', 'warning': '#ffb84d', 'info': '#d7d7d7'}.get(level, '#d7d7d7')
+            self.log_text.append(f'<span style="color:{color};">{text}</span>')
+            self.log_text.verticalScrollBar().setValue(self.log_text.verticalScrollBar().maximum())
+        print(text)
+
+    def _handle_exception(self, context, exc):
+        message = f"{context}: {exc}"
+        self._append_log(message, level='error')
+        self.status_label.setText("Error: see log panel")
+
+    def _safe_call(self, context, func, *args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except Exception as exc:
+            self._handle_exception(context, exc)
+            return None
+
+    def _qt_exception_hook(self, exc_type, exc_value, exc_traceback):
+        message = ''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        self._append_log(message, level='error')
+        self.status_label.setText("Unhandled error: see log panel")
+
+    def _configure_coordinate_controls(self):
+        coord_system = getattr(self, 'coord_system', 'spherical')
+
+        if coord_system == 'polar':
+            self.r_label.setText("Radial r:")
+            self.theta_label.setText("Not used")
+            self.phi_label.setText("Azimuthal φ:")
+            self.theta_min.setEnabled(False)
+            self.theta_max.setEnabled(False)
+            self.slice_type_label.setText("2D polar")
+            self.slice_type_combo.blockSignals(True)
+            self.slice_type_combo.clear()
+            self.slice_type_combo.addItems(['r', 'phi'])
+            self.slice_type_combo.setEnabled(False)
+            self.slice_type_combo.setCurrentText('phi')
+            self.slice_type_combo.blockSignals(False)
+            return
+
+        self.theta_min.setEnabled(True)
+        self.theta_max.setEnabled(True)
+
+        if coord_system == 'cylindrical':
+            self.r_label.setText("r:")
+            self.theta_label.setText("z:")
+            self.phi_label.setText("φ:")
+            self.slice_type_label.setText("Slice type:")
+            self.slice_type_combo.blockSignals(True)
+            self.slice_type_combo.clear()
+            self.slice_type_combo.addItems(['z', 'phi'])
+            self.slice_type_combo.setEnabled(True)
+            self.slice_type_combo.setCurrentText('z')
+            self.slice_type_combo.blockSignals(False)
+            return
+
+        self.r_label.setText("r:")
+        self.theta_label.setText("θ:")
+        self.phi_label.setText("φ:")
+        self.slice_type_label.setText("Slice type:")
+        self.slice_type_combo.blockSignals(True)
+        self.slice_type_combo.clear()
+        self.slice_type_combo.addItems(['theta', 'phi'])
+        self.slice_type_combo.setEnabled(True)
+        self.slice_type_combo.setCurrentText('theta')
+        self.slice_type_combo.blockSignals(False)
+
     def _set_velocity_options(self, components):
         """Only touch the velocity dropdown if the options actually change."""
         desired = list(components)
@@ -938,7 +1028,8 @@ class PlotInteractiveWindow(QWidget):
         self.slice_type_combo.addItems(['theta', 'phi'])  # Will be updated based on coordinate system
         self.slice_type_combo.setCurrentText('theta')
         self.slice_type_combo.currentTextChanged.connect(self.on_slice_type_change)
-        slice_grid.addWidget(QLabel("Slice type:"), 4, 0)
+        self.slice_type_label = QLabel("Slice type:")
+        slice_grid.addWidget(self.slice_type_label, 4, 0)
         slice_grid.addWidget(self.slice_type_combo, 4, 1, 1, 2)
 
         slice_box = QGroupBox("Slices")
@@ -1120,6 +1211,21 @@ class PlotInteractiveWindow(QWidget):
         left_panel_layout.addWidget(logo_label, alignment=Qt.AlignHCenter)
         left_panel_layout.addWidget(controls_group, stretch=1)
 
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(180)
+        self.log_text.setPlaceholderText("Interface log")
+        self.log_text.setStyleSheet("""
+            QTextEdit {
+                background: #1f2327;
+                border: 1px solid #444;
+                color: #d7d7d7;
+                font-size: 12px;
+            }
+        """)
+        left_panel_layout.addWidget(QLabel("Log"))
+        left_panel_layout.addWidget(self.log_text)
+
         left_panel_widget.setMinimumWidth(420)
         left_panel_widget.setMaximumWidth(520)
         left_panel_widget.setStyleSheet("""
@@ -1258,7 +1364,7 @@ class PlotInteractiveWindow(QWidget):
         path = QFileDialog.getExistingDirectory(self, "Select simulation output directory")
         if path:
             self.path_line.setText(path)
-            self.load_simulation(path)
+            self._safe_call("Loading simulation", self.load_simulation, path)
 
     def load_simulation(self, path):
         self.sim = fp.Simulation(output_dir=path)
@@ -1266,19 +1372,15 @@ class PlotInteractiveWindow(QWidget):
         
         # Detect coordinate system
         self.coord_system = getattr(self.sim.vars, 'COORDINATES', 'spherical').lower()
-        
+        is_polar_2d = self._is_polar_2d()
+
         # Update UI based on coordinate system
-        if self.coord_system == 'cylindrical':
-            self.theta_label.setText("z:")
-            self.slice_type_combo.clear()
-            self.slice_type_combo.addItems(['z', 'phi'])
-            self.slice_type_combo.setCurrentText('z')
+        self._configure_coordinate_controls()
+        if is_polar_2d:
+            self.slice_type = 'phi'
+        elif self.coord_system == 'cylindrical':
             self.slice_type = 'z'
-        else:  # spherical
-            self.theta_label.setText("θ:")
-            self.slice_type_combo.clear()
-            self.slice_type_combo.addItems(['theta', 'phi'])
-            self.slice_type_combo.setCurrentText('theta')
+        else:
             self.slice_type = 'theta'
         
         self.time_slider.setEnabled(True)
@@ -1288,16 +1390,24 @@ class PlotInteractiveWindow(QWidget):
         self.r_min.setText("")
         self.r_max.setText("")
         
-        # Set initial theta/z value based on coordinate system
-        if self.coord_system == 'cylindrical':
-            # For cylindrical, z defaults to 0 or middle of domain
+        # Set initial coordinate values based on coordinate system
+        if is_polar_2d:
+            self.theta_min.setText("")
+            self.theta_max.setText("")
+            self.phi_min.setText("")
+            self.phi_max.setText("")
+        elif self.coord_system == 'cylindrical':
             try:
                 z_val = self._format_angle(0.0)
                 self.theta_min.setText(z_val)
-            except:
+            except Exception:
                 self.theta_min.setText("0.0")
         else:  # spherical
-            self.theta_min.setText(self._format_angle(self.sim.domains.theta.max()))
+            theta_domain = getattr(self.sim.domains, 'theta', None)
+            if theta_domain is not None:
+                self.theta_min.setText(self._format_angle(theta_domain.max()))
+            else:
+                self.theta_min.setText("")
         
         self.theta_max.setText('')
         self.phi_min.setText("")
@@ -1305,6 +1415,10 @@ class PlotInteractiveWindow(QWidget):
         self.last_slice_str = ""
         for edit in [self.r_min, self.r_max, self.theta_min, self.theta_max, self.phi_min, self.phi_max]:
             edit.setEnabled(True)
+        if self._is_polar_2d():
+            self.theta_min.setEnabled(False)
+            self.theta_max.setEnabled(False)
+            self.slice_type_combo.setEnabled(False)
         self.res_slider.setEnabled(True)
         self.interp_toggle.setEnabled(True)
         self.streamlines_toggle.setEnabled(True)
@@ -1329,6 +1443,7 @@ class PlotInteractiveWindow(QWidget):
             self.cmap_dropdown.setCurrentText('inferno')
         except Exception:
             pass
+        self._append_log(f"Loaded simulation in {self.coord_system} mode")
         self.plot_density()
 
     def show_sim_info(self):
@@ -1338,6 +1453,10 @@ class PlotInteractiveWindow(QWidget):
 
     def on_slice_type_change(self, text):
         self.slice_type = text
+        if self._is_polar_2d():
+            self._append_log("Polar 2D simulations use radial/azimuthal bounds only.", level='warning')
+            self.plot_density()
+            return
         # When changing slice type, reset fields according to convention
         coord_system = getattr(self, 'coord_system', 'spherical')
         
@@ -1349,8 +1468,12 @@ class PlotInteractiveWindow(QWidget):
                 self.theta_min.setText(z_val)
             else:
                 # For spherical, default theta=max
-                theta_val = self._format_angle(self.sim.domains.theta.max())
-                self.theta_min.setText(theta_val)
+                theta_domain = getattr(self.sim.domains, 'theta', None)
+                if theta_domain is not None:
+                    theta_val = self._format_angle(theta_domain.max())
+                    self.theta_min.setText(theta_val)
+                else:
+                    self.theta_min.setText("")
             self.theta_max.setText('')
             self.phi_min.setText("")
             self.phi_max.setText("")
@@ -1398,6 +1521,37 @@ class PlotInteractiveWindow(QWidget):
             (x_max_ul, y_min_ul),
             (x_max_ul, y_max_ul)
         ]
+
+        if self._is_polar_2d():
+            r_list = []
+            phi_list = []
+
+            for x, y in corners:
+                r_list.append(np.sqrt(x**2 + y**2))
+                phi_list.append(np.arctan2(y, x))
+
+            r_min = np.min(r_list)
+            r_max = np.max(r_list)
+            phi_min = np.min(phi_list)
+            phi_max = np.max(phi_list)
+
+            self.r_min.setText(self._sim_length_to_display(r_min))
+            self.r_max.setText(self._sim_length_to_display(r_max))
+            self.phi_min.setText(self._format_angle(phi_min))
+            self.phi_max.setText(self._format_angle(phi_max))
+            self.theta_min.setText("")
+            self.theta_max.setText("")
+
+            slice_str = (
+                f"r=[{r_min:.3f},{r_max:.3f}],"
+                f"phi=[{phi_min:.3f},{phi_max:.3f}]"
+            )
+            self.last_slice_str = slice_str
+            self._fields_edited = False
+
+            if self.fixed_cbar_enabled:
+                self.update_fixed_cbar_limits()
+            return
 
         coord_system = getattr(self, 'coord_system', 'spherical')
         r_list = []
@@ -1453,7 +1607,8 @@ class PlotInteractiveWindow(QWidget):
             if coord_system == 'cylindrical':
                 theta_val = self._format_angle(0.0)  # Default z=0
             else:
-                theta_val = self._format_angle(self.sim.domains.theta.max())
+                    theta_domain = getattr(self.sim.domains, 'theta', None)
+                    theta_val = self._format_angle(theta_domain.max()) if theta_domain is not None else ""
             self.theta_min.setText(theta_val)
             self.theta_max.setText(theta_val)
             self.r_min.setText(self._sim_length_to_display(r_min))
@@ -1489,6 +1644,8 @@ class PlotInteractiveWindow(QWidget):
         # DO NOT call self.plot_density() here
 
     def build_slice_str(self):
+        if self._is_polar_2d():
+            return self._manual_polar_slice_str()
         # If the user edited any field manually SINCE the last update, ignore last_slice_str
         if getattr(self, "_fields_edited", False):
             return self._manual_slice_str()
@@ -1496,6 +1653,38 @@ class PlotInteractiveWindow(QWidget):
         if self.last_slice_str:
             return self.last_slice_str
         return self._manual_slice_str()
+
+    def _manual_polar_slice_str(self):
+        def norm(txt):
+            return txt.replace(',', '.').strip()
+
+        r_min_val = self._length_input_to_sim_units(norm(self.r_min.text()))
+        r_max_val = self._length_input_to_sim_units(norm(self.r_max.text()))
+        phi_min_val = norm(self.phi_min.text())
+        phi_max_val = norm(self.phi_max.text())
+
+        slice_parts = []
+        if r_min_val and r_max_val:
+            if abs(float(r_min_val) - float(r_max_val)) < 1e-10:
+                slice_parts.append(f"r={r_min_val}")
+            else:
+                slice_parts.append(f"r=[{r_min_val},{r_max_val}]")
+        elif r_min_val:
+            slice_parts.append(f"r={r_min_val}")
+        elif r_max_val:
+            slice_parts.append(f"r={r_max_val}")
+
+        if phi_min_val and phi_max_val:
+            if abs(float(phi_min_val) - float(phi_max_val)) < 1e-10:
+                slice_parts.append(f"phi={phi_min_val}")
+            else:
+                slice_parts.append(f"phi=[{phi_min_val},{phi_max_val}]")
+        elif phi_min_val:
+            slice_parts.append(f"phi={phi_min_val}")
+        elif phi_max_val:
+            slice_parts.append(f"phi={phi_max_val}")
+
+        return ",".join(slice_parts)
 
     def _manual_slice_str(self):
         def norm(txt):
@@ -1616,6 +1805,7 @@ class PlotInteractiveWindow(QWidget):
         selected_field_type = field_catalog.get(selected_field)
         scalar_field_name = selected_field if selected_field and selected_field_type == 'scalar' else None
         vector_field_name = selected_field if selected_field and selected_field_type == 'vector' else None
+        load_coords = 'cartesian'
 
         # Determine axes and mesh names based on fixed coordinates (same logic as plot_density)
         def is_fixed(var, slice_str):
@@ -1635,8 +1825,14 @@ class PlotInteractiveWindow(QWidget):
                     pass
             return False
 
+        polar_native = self._is_polar_2d()
+
         # Check for theta (spherical) or z (cylindrical) being fixed
-        if is_fixed('theta', slice_str) or is_fixed('z', slice_str):
+        if polar_native:
+            mesh_x_name = 'var1_mesh'
+            mesh_y_name = 'var2_mesh'
+            use_var3 = False
+        elif is_fixed('theta', slice_str) or is_fixed('z', slice_str):
             mesh_x_name = 'var1_mesh'
             mesh_y_name = 'var2_mesh'
             use_var3 = False
@@ -1657,7 +1853,8 @@ class PlotInteractiveWindow(QWidget):
                     data = self.sim.load_field(
                         fields=[density_field, vector_field],
                         slice=slice_str,
-                        snapshot=snap
+                        snapshot=snap,
+                        coords=load_coords
                     )
                     if hasattr(data, 'evaluate'):
                         xmin, xmax = getattr(data, mesh_x_name)[0].min(), getattr(data, mesh_x_name)[0].max()
@@ -1666,9 +1863,9 @@ class PlotInteractiveWindow(QWidget):
                         ys = np.linspace(ymin, ymax, res)
                         X, Y = np.meshgrid(xs, ys)
                         if use_var3:
-                            data_map = data.evaluate(field=density_field, time=snap, var1=X, var3=Y)
+                            data_map = data.evaluate(field=density_field, time=snap, var1=X, var3=Y, coords='cartesian')
                         else:
-                            data_map = data.evaluate(field=density_field, time=snap, var1=X, var2=Y)
+                            data_map = data.evaluate(field=density_field, time=snap, var1=X, var2=Y, coords='cartesian')
                         dens_raw = data_map * self.sim.URHO
                         data_map = np.where(dens_raw > 0, np.log10(dens_raw), np.nan)
                     else:
@@ -1680,7 +1877,8 @@ class PlotInteractiveWindow(QWidget):
                     gasv = self.sim.load_field(
                         fields=vector_field,
                         slice=slice_str,
-                        snapshot=snap
+                        snapshot=snap,
+                        coords=load_coords
                     )
                     
                     if hasattr(gasv, 'evaluate'):
@@ -1690,9 +1888,9 @@ class PlotInteractiveWindow(QWidget):
                         ys = np.linspace(ymin, ymax, res)
                         X, Y = np.meshgrid(xs, ys)
                         if use_var3:
-                            vel = gasv.evaluate(field=vector_field, time=snap, var1=X, var3=Y)
+                            vel = gasv.evaluate(field=vector_field, time=snap, var1=X, var3=Y, coords='cartesian')
                         else:
-                            vel = gasv.evaluate(field=vector_field, time=snap, var1=X, var2=Y)
+                            vel = gasv.evaluate(field=vector_field, time=snap, var1=X, var2=Y, coords='cartesian')
                         idx = VEL_INDEX.get(vel_comp, 0)
                         # Convert to km/s (consistent with plot_density)
                         v_factor = self.sim.UL / self.sim.UT
@@ -1713,7 +1911,8 @@ class PlotInteractiveWindow(QWidget):
                     gasenergy = self.sim.load_field(
                         fields=energy_field,
                         slice=slice_str,
-                        snapshot=snap
+                        snapshot=snap,
+                        coords=load_coords
                     )
                     if hasattr(gasenergy, 'evaluate'):
                         xmin, xmax = getattr(gasenergy, mesh_x_name)[0].min(), getattr(gasenergy, mesh_x_name)[0].max()
@@ -1722,9 +1921,9 @@ class PlotInteractiveWindow(QWidget):
                         ys = np.linspace(ymin, ymax, res)
                         X, Y = np.meshgrid(xs, ys)
                         if use_var3:
-                            data_map = gasenergy.evaluate(field=energy_field, time=snap, var1=X, var3=Y)
+                            data_map = gasenergy.evaluate(field=energy_field, time=snap, var1=X, var3=Y, coords='cartesian')
                         else:
-                            data_map = gasenergy.evaluate(field=energy_field, time=snap, var1=X, var2=Y)
+                            data_map = gasenergy.evaluate(field=energy_field, time=snap, var1=X, var2=Y, coords='cartesian')
                     else:
                         data_map = getattr(gasenergy, f'{energy_field}_mesh')[0]
                 # Ignore NaNs for min/max
@@ -1808,6 +2007,9 @@ class PlotInteractiveWindow(QWidget):
             )
 
     def plot_density(self, unitsys_override=None):
+        return self._safe_call("Plot update", self._plot_density_impl, unitsys_override)
+
+    def _plot_density_impl(self, unitsys_override=None):
         if not self.sim:
             return
 
@@ -1875,8 +2077,14 @@ class PlotInteractiveWindow(QWidget):
                     pass
             return False
 
+        polar_native = self._is_polar_2d()
+
         # Check for theta (spherical) or z (cylindrical) being fixed
-        if is_fixed('theta', slice_str) or is_fixed('z', slice_str):
+        if polar_native:
+            mesh_x_name = 'var1_mesh'
+            mesh_y_name = 'var2_mesh'
+            self._set_velocity_options(['vx', 'vy'])
+        elif is_fixed('theta', slice_str) or is_fixed('z', slice_str):
             mesh_x_name = 'var1_mesh'
             mesh_y_name = 'var2_mesh'
             self._set_velocity_options(['vx', 'vy'])
@@ -1890,13 +2098,15 @@ class PlotInteractiveWindow(QWidget):
             self._set_velocity_options(['vx', 'vy'])
 
         # Load data according to selection
+        load_coords = 'cartesian' if polar_native else 'cartesian'
         if map_type == 'Density':
             density_field = scalar_field_name or 'gasdens'
             vector_field = vector_field_name or 'gasv'
             data = self.sim.load_field(
                 fields=[density_field, vector_field],
                 slice=slice_str,
-                snapshot=n
+                snapshot=n,
+                coords=load_coords
             )
         elif map_type == 'Energy':
             energy_field = scalar_field_name or 'gasenergy'
@@ -1904,19 +2114,22 @@ class PlotInteractiveWindow(QWidget):
             gasenergy = self.sim.load_field(
                 fields=energy_field,
                 slice=slice_str,
-                snapshot=n
+                snapshot=n,
+                coords=load_coords
             )
             gasv = self.sim.load_field(
                 fields=vector_field,
                 slice=slice_str,
-                snapshot=n
+                snapshot=n,
+                coords=load_coords
             )
         elif map_type == 'Velocity':
             vector_field = vector_field_name or 'gasv'
             gasv = self.sim.load_field(
                 fields=vector_field,
                 slice=slice_str,
-                snapshot=n
+                snapshot=n,
+                coords=load_coords
             )
 
         # Select the object that provides the mesh arrays (used for xmin/xmax/ymin/ymax)
@@ -1936,20 +2149,20 @@ class PlotInteractiveWindow(QWidget):
                 ys = np.linspace(ymin, ymax, res)
                 X, Y = np.meshgrid(xs, ys)
                 if map_type == 'Density':
-                    data_map = data.evaluate(field=density_field, time=n, var1=X, var2=Y)
+                    data_map = data.evaluate(field=density_field, time=n, var1=X, var2=Y, coords='cartesian')
                     data_map = np.log10(data_map * self.sim.URHO)
-                    vel = data.evaluate(field=vector_field, time=n, var1=X, var2=Y)
+                    vel = data.evaluate(field=vector_field, time=n, var1=X, var2=Y, coords='cartesian')
                     vx = vel[0]
                     vy = vel[1]
                     vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Energy':
-                    data_map = gasenergy.evaluate(field=energy_field, time=n, var1=X, var2=Y)
-                    vel = gasv.evaluate(time=n, var1=X, var2=Y)
+                    data_map = gasenergy.evaluate(field=energy_field, time=n, var1=X, var2=Y, coords='cartesian')
+                    vel = gasv.evaluate(time=n, var1=X, var2=Y, coords='cartesian')
                     vx = vel[0]
                     vy = vel[1]
                     vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Velocity':
-                    vel = gasv.evaluate(time=n, var1=X, var2=Y)
+                    vel = gasv.evaluate(time=n, var1=X, var2=Y, coords='cartesian')
                     idx = VEL_INDEX[vel_comp]
                     data_map = vel[idx]
                     vx = vel[0]
@@ -1962,20 +2175,20 @@ class PlotInteractiveWindow(QWidget):
                 zs = np.linspace(zmin, zmax, res)
                 X, Y = np.meshgrid(xs, zs)
                 if map_type == 'Density':
-                    data_map = data.evaluate(field=density_field, time=n, var1=X, var3=Y)
+                    data_map = data.evaluate(field=density_field, time=n, var1=X, var2=Y, coords='cartesian')
                     data_map = np.log10(data_map * self.sim.URHO)
-                    vel = data.evaluate(field=vector_field, time=n, var1=X, var3=Y)
+                    vel = data.evaluate(field=vector_field, time=n, var1=X, var2=Y, coords='cartesian')
                     vx = vel[0]
                     vy = vel[2]
                     vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Energy':
-                    data_map = gasenergy.evaluate(field=energy_field, time=n, var1=X, var3=Y)
-                    vel = gasv.evaluate(time=n, var1=X, var3=Y)
+                    data_map = gasenergy.evaluate(field=energy_field, time=n, var1=X, var2=Y, coords='cartesian')
+                    vel = gasv.evaluate(time=n, var1=X, var2=Y, coords='cartesian')
                     vx = vel[0]
                     vy = vel[2]
                     vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Velocity':
-                    vel = gasv.evaluate(time=n, var1=X, var3=Y)
+                    vel = gasv.evaluate(time=n, var1=X, var2=Y, coords='cartesian')
                     idx = VEL_INDEX[vel_comp]
                     data_map = vel[idx]
                     vx = vel[0]
@@ -2579,6 +2792,7 @@ if __name__ == "__main__":
     print("Starting GUI...")
     app = QApplication(sys.argv)
     window = PlotInteractiveWindow()
+    sys.excepthook = window._qt_exception_hook
     window.setWindowTitle("FARGOpy Interactive Plot")
     window.resize(1350, 800)
     window.show()
