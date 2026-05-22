@@ -12,6 +12,13 @@ def sim():
     return fp.Simulation(output_dir=f"/tmp/p3disoj")
 
 
+@pytest.fixture(scope="session")
+def sim2d():
+    # 2D Fargo3D simulation used to validate the no-slice loading path
+    fp.Simulation.download_precomputed("fargo")
+    return fp.Simulation(output_dir="/tmp/fargo")
+
+
 def test_interpolacion_1d_point(sim):
     data = sim.load_field(
         fields="gasdens",
@@ -124,3 +131,86 @@ def test_interpolacion_3d_array(sim):
     assert np.isfinite(valor).all(), (
         "With nearest, NaNs should not appear except for extremely out-of-domain points"
     )
+
+
+def test_interpolacion_2d_no_slice_polar(sim2d):
+    data = sim2d.load_field(
+        fields="gasdens",
+        snapshot=0,
+        coords="polar",
+    )
+
+    assert data.dim == 2
+    assert data._original_coords == "polar"
+
+    row = data.df.iloc[0]
+    phi_mesh = np.asarray(row.var1_mesh)
+    r_mesh = np.asarray(row.var2_mesh)
+
+    assert phi_mesh.shape == r_mesh.shape
+    assert np.asarray(row.var3_mesh).shape == phi_mesh.shape
+
+    phi = float(phi_mesh[phi_mesh.shape[0] // 2, phi_mesh.shape[1] // 2])
+    r = float(r_mesh[r_mesh.shape[0] // 2, r_mesh.shape[1] // 2])
+    valor = data.evaluate(var1=phi, var2=r, snapshot=0, interpolator="griddata", method="nearest")
+
+    assert np.isfinite(valor), "2D polar no-slice interpolation must stay finite"
+
+
+def test_interpolacion_2d_no_slice_cartesian(sim2d):
+    data = sim2d.load_field(
+        fields="gasdens",
+        snapshot=0,
+        coords="cartesian",
+    )
+
+    assert data.dim == 2
+    assert data._original_coords == "cartesian"
+
+    row = data.df.iloc[0]
+    x_mesh = np.asarray(row.var1_mesh)
+    y_mesh = np.asarray(row.var2_mesh)
+
+    assert x_mesh.shape == y_mesh.shape
+    assert np.asarray(row.var3_mesh).shape == x_mesh.shape
+
+    x = float(x_mesh[x_mesh.shape[0] // 2, x_mesh.shape[1] // 2])
+    y = float(y_mesh[y_mesh.shape[0] // 2, y_mesh.shape[1] // 2])
+    valor = data.evaluate(var1=x, var2=y, snapshot=0, interpolator="griddata", method="nearest")
+
+    assert np.isfinite(valor), "2D cartesian no-slice interpolation must stay finite"
+
+
+def test_interpolacion_2d_no_snapshot_uses_latest(sim2d):
+    data = sim2d.load_field(
+        fields="gasdens",
+        coords="cartesian",
+    )
+
+    assert data.snapshot[0] == sim2d.nsnaps - 1
+
+    row = data.df.iloc[0]
+    arr = np.asarray(row.gasdens_mesh)
+    assert np.nanstd(arr) > 0, "Default 2D load should not return a uniform initial state"
+
+
+def test_interpolacion_2d_cartesian_full_mesh_no_nan_seam(sim2d):
+    data = sim2d.load_field(
+        fields="gasdens",
+        snapshot=10,
+        coords="cartesian",
+    )
+
+    row = data.df.iloc[0]
+    x_mesh = np.asarray(row.var1_mesh)
+    y_mesh = np.asarray(row.var2_mesh)
+
+    valor = data.evaluate(
+        var1=x_mesh,
+        var2=y_mesh,
+        snapshot=10,
+        interpolator="griddata",
+        method="linear",
+    )
+
+    assert np.isfinite(valor).all(), "The full 2D cartesian mesh must not leave a NaN seam"

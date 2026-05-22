@@ -8,6 +8,7 @@ Mid-term:
 - Create developer tutorials.
 - Multifluid read.
 - Create new fields from multifluid.
+- Tests battery for multiple coords
 
 Long-term:
 - Create a complete documentation.

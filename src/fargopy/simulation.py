@@ -1079,6 +1079,31 @@ class Simulation(fargopy.Fargobj):
             print(f"No summary file '{summary_path}' found.")
             return []
 
+        def _parse_planet_config_line(line):
+            """Return a planet entry if a config line matches the expected format."""
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                return None
+
+            parts = stripped.split()
+            if len(parts) < 2 or not parts[0][0].isalpha():
+                return None
+
+            numeric_values = []
+            for token in parts[1:]:
+                try:
+                    numeric_values.append(float(token))
+                except ValueError:
+                    break
+
+            if len(numeric_values) < 3:
+                return None
+
+            return {
+                "name": parts[0],
+                "posi": (numeric_values[0], numeric_values[1], numeric_values[2]),
+            }
+
         # Get stellar mass
         if (
             not hasattr(self, "simulation_macros")
@@ -1091,28 +1116,46 @@ class Simulation(fargopy.Fargobj):
         initial_planets = []
         with open(summary_path, "r") as f:
             lines = f.readlines()
+
+        # Parse planet names from the planetary config block, which preserves
+        # the declaration order and avoids summary macros such as ROCHESMOOTHING.
+        config_planets = []
+        in_config_block = False
+        in_config_body = False
         for line in lines:
-            if (
-                line.strip().startswith("#")
-                or not line.strip()
-                or set(line.strip()) == set("-")
-            ):
+            stripped = line.strip()
+            if "Planetary system config file:" in line:
+                in_config_block = True
+                in_config_body = False
                 continue
-            parts = line.split()
-            if len(parts) >= 3:
-                try:
-                    float(parts[0])
-                    continue  # skip if first field is a number
-                except ValueError:
-                    pass
-                try:
-                    name = parts[0]
-                    x0 = float(parts[1])
-                    y0 = float(parts[2]) if len(parts) > 3 else 0.0
-                    z0 = 0.0
-                    initial_planets.append({"name": name, "posi": (x0, y0, z0)})
-                except Exception:
+            if not in_config_block:
+                continue
+            if stripped == "#-----------":
+                if not in_config_body:
+                    in_config_body = True
                     continue
+                break
+            if not in_config_body:
+                continue
+
+            planet_entry = _parse_planet_config_line(line)
+            if planet_entry is not None:
+                config_planets.append(planet_entry)
+
+        # If the config block was not found, fall back to the legacy scan.
+        if not config_planets:
+            for line in lines:
+                if (
+                    line.strip().startswith("#")
+                    or not line.strip()
+                    or set(line.strip()) == set("-")
+                ):
+                    continue
+                planet_entry = _parse_planet_config_line(line)
+                if planet_entry is not None:
+                    config_planets.append(planet_entry)
+
+        initial_planets = config_planets
 
         # Find PLANETARY SYSTEM SECTION
         planet_indices = []
@@ -1125,6 +1168,9 @@ class Simulation(fargopy.Fargobj):
                 planet_indices.append(i + 1)  # next line has the data
             if in_section and line.strip().startswith("***"):
                 break
+
+        if planet_indices and len(initial_planets) > len(planet_indices):
+            initial_planets = initial_planets[-len(planet_indices) :]
 
         planets = []
         for idx, data_idx in enumerate(planet_indices):
@@ -1378,6 +1424,7 @@ class Simulation(fargopy.Fargobj):
         # Load domains
         domains = dict()
         domains["extrema"] = dict()
+        domains["edges"] = dict()
 
         for i, variable_suffix in enumerate(variable_suffixes):
             domain_file = os.path.join(
@@ -1391,13 +1438,15 @@ class Simulation(fargopy.Fargobj):
 
             if os.path.isfile(domain_file):
                 # Load data from file
-                domains[variable_names[i]] = np.genfromtxt(domain_file)
+                raw_domain = np.genfromtxt(domain_file)
 
                 if len(borders[i]) > 0:
                     # Drop the border of the domain
-                    domains[variable_names[i]] = domains[variable_names[i]][
-                        borders[i][0] : borders[i][1]
-                    ]
+                    raw_domain = raw_domain[borders[i][0] : borders[i][1]]
+
+                domains["edges"][variable_names[i]] = raw_domain
+
+                domains[variable_names[i]] = raw_domain
 
                 if middle and len(domains[variable_names[i]]) > 1:
                     # Average between domain cell coordinates
@@ -1579,14 +1628,34 @@ class Simulation(fargopy.Fargobj):
         if field in detected:
             return detected[field]
 
+        # If user passed a component-specific name (e.g. 'dust1vx'), try to
+        # resolve it to the vector base (e.g. 'dust1v') before falling back to
+        # scalar detection. This allows callers to pass any of the component
+        # filenames and still get the full vector behaviour.
+        if len(field) > 1 and field[-1] in ("x", "y", "z"):
+            base = field[:-1]
+            if base in detected:
+                return detected[base]
+
+        # Check scalar file
         scalar_file = os.path.join(self.output_dir, f"{field}{snapshot}.dat")
         if os.path.isfile(scalar_file):
             return "scalar"
 
-        components = ["x", "y"] + (["z"] if getattr(self.vars, "DIM", 3) == 3 else [])
+        # Check vector components for the given field name or for a base name
+        components = ["x", "y"] + (['z'] if getattr(self.vars, "DIM", 3) == 3 else [])
+
+        # If a direct vector (field + comp) exists, it's a vector
         vector_files = [os.path.join(self.output_dir, f"{field}{comp}{snapshot}.dat") for comp in components]
         if all(os.path.isfile(component) for component in vector_files):
             return "vector"
+
+        # If the provided name ends with a component letter, check the base
+        if len(field) > 1 and field[-1] in ("x", "y", "z"):
+            base = field[:-1]
+            vector_files = [os.path.join(self.output_dir, f"{base}{comp}{snapshot}.dat") for comp in components]
+            if all(os.path.isfile(component) for component in vector_files):
+                return "vector"
 
         raise ValueError(f"Field type for '{field}' could not be inferred from output files.")
 
@@ -1608,12 +1677,20 @@ class Simulation(fargopy.Fargobj):
 
         # Load vector
         elif field_type == "vector":
+            # Allow callers to pass one of the component names (e.g. 'dust1vx')
+            # or the canonical base ('dust1v'). Resolve to the canonical base
+            # before composing component filenames.
+            if len(field) > 1 and field[-1] in ("x", "y", "z"):
+                base_field = field[:-1]
+            else:
+                base_field = field
+
             data = []
             components = ["x", "y"]
             if self.vars.DIM == 3:
                 components += ["z"]
             for comp in components:
-                file_name = f"{field}{comp}{snapshot}.dat"
+                file_name = f"{base_field}{comp}{snapshot}.dat"
                 file_field = os.path.join(self.output_dir, file_name)
                 data.append(self._load_field_scalar(file_field))
             data = np.array(data)

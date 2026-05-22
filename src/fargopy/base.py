@@ -603,7 +603,9 @@ class FieldsHandler(Fargobj):
             elif coords is None:
                 coords = "polar"
 
-        handler = fargopy.FieldInterpolator(self.sim)
+        from fargopy.fields import FieldInterpolator
+
+        handler = FieldInterpolator(self.sim)
         handler.load_data(
             fields=self.fields,
             slice=self.slice,

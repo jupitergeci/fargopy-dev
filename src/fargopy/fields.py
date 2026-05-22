@@ -341,12 +341,12 @@ class Field(fargopy.Fargobj):
                     vz = self.data[2]
                 else:
                     vz = np.zeros_like(vr)
-                vx = vr*np.cos(phi) 
-                vy = vr*np.sin(phi)
+                vx = vr*np.cos(phi) - vphi*np.sin(phi)
+                vy = vr*np.sin(phi) + vphi*np.cos(phi)
                 
-                return (Field(vx,coordinates=self.coordinates,domains=self.domains,type='scalar'),
-                        Field(vy,coordinates=self.coordinates,domains=self.domains,type='scalar'),
-                        Field(vz,coordinates=self.coordinates,domains=self.domains,type='scalar'))
+                return (Field(vx,coordinates='cartesian',domains=self.domains,type='scalar'),
+                        Field(vy,coordinates='cartesian',domains=self.domains,type='scalar'),
+                        Field(vz,coordinates='cartesian',domains=self.domains,type='scalar'))
             
             if self.coordinates == 'spherical':
 
@@ -359,9 +359,9 @@ class Field(fargopy.Fargobj):
                 vy = vr*np.sin(theta)*np.sin(phi) + vtheta*np.cos(theta)*np.sin(phi) + vphi*np.cos(phi)
                 vz = vr*np.cos(theta) - vtheta*np.sin(theta)
 
-                return (Field(vx,coordinates=self.coordinates,domains=self.domains,type='scalar'),
-                        Field(vy,coordinates=self.coordinates,domains=self.domains,type='scalar'),
-                        Field(vz,coordinates=self.coordinates,domains=self.domains,type='scalar'))
+                return (Field(vx,coordinates='cartesian',domains=self.domains,type='scalar'),
+                    Field(vy,coordinates='cartesian',domains=self.domains,type='scalar'),
+                    Field(vz,coordinates='cartesian',domains=self.domains,type='scalar'))
             
     def get_size(self):
         """
@@ -408,6 +408,8 @@ class FieldInterpolator(fargopy.Fargobj):
     The ``FieldInterpolator`` facilitates loading, slicing, and interpolating
     simulation data across multiple snapshots and fields. It handles coordinate
     transformations and dimensionality reduction based on slice definitions.
+    Native 2D polar data is handled on the (phi, r) plane, with phi as the
+    first coordinate and r as the second one.
 
     Attributesde
     ----------
@@ -474,33 +476,48 @@ class FieldInterpolator(fargopy.Fargobj):
             return
         dom = self.sim.domains
         coords = self.sim.vars.COORDINATES
+
+        edges = None
+        if hasattr(dom, 'edges') and isinstance(dom.edges, dict):
+            edges = dom.edges
         
         if coords == 'polar':
+            r_vals = edges.get('r') if edges and edges.get('r') is not None else dom.r
+            phi_vals = edges.get('phi') if edges and edges.get('phi') is not None else dom.phi
             self._domain_limits = dict(
-                r=(dom.r.min(), dom.r.max()),
-                phi=(dom.phi.min(), dom.phi.max()),
+                r=(r_vals.min(), r_vals.max()),
+                phi=(phi_vals.min(), phi_vals.max()),
                 z=(None, None),
                 theta=(None, None)
             )
         elif coords == 'spherical':
+            r_vals = edges.get('r') if edges and edges.get('r') is not None else dom.r
+            phi_vals = edges.get('phi') if edges and edges.get('phi') is not None else dom.phi
+            theta_vals = edges.get('theta') if edges and edges.get('theta') is not None else dom.theta
             self._domain_limits = dict(
-                r=(dom.r.min(), dom.r.max()),
-                theta=(dom.theta.min(), dom.theta.max()),
-                phi=(dom.phi.min(), dom.phi.max()),
+                r=(r_vals.min(), r_vals.max()),
+                theta=(theta_vals.min(), theta_vals.max()),
+                phi=(phi_vals.min(), phi_vals.max()),
                 z=(None, None)
             )
         elif coords == 'cylindrical':
+            r_vals = edges.get('r') if edges and edges.get('r') is not None else dom.r
+            phi_vals = edges.get('phi') if edges and edges.get('phi') is not None else dom.phi
+            z_vals = edges.get('z') if edges and edges.get('z') is not None else dom.z
             self._domain_limits = dict(
-                r=(dom.r.min(), dom.r.max()),
-                z=(dom.z.min(), dom.z.max()),
-                phi=(dom.phi.min(), dom.phi.max()),
+                r=(r_vals.min(), r_vals.max()),
+                z=(z_vals.min(), z_vals.max()),
+                phi=(phi_vals.min(), phi_vals.max()),
                 theta=(None, None)
             )
         else:  # cartesian
+            x_vals = edges.get('x') if edges and edges.get('x') is not None else dom.x
+            y_vals = edges.get('y') if edges and edges.get('y') is not None else dom.y
+            z_vals = edges.get('z') if edges and edges.get('z') is not None else dom.z
             self._domain_limits = dict(
-                x=(dom.x.min(), dom.x.max()),
-                y=(dom.y.min(), dom.y.max()),
-                z=(dom.z.min(), dom.z.max()),
+                x=(x_vals.min(), x_vals.max()),
+                y=(y_vals.min(), y_vals.max()),
+                z=(z_vals.min(), z_vals.max()),
                 r=(None, None),
                 theta=(None, None),
                 phi=(None, None)
@@ -901,12 +918,34 @@ class FieldInterpolator(fargopy.Fargobj):
         if isinstance(fields, str):
             fields = [fields]
 
-        self.fields = fields
+        # Normalize field list: allow callers to pass component-specific names
+        # like 'dust1vx'/'dust1vy' and normalize them to the canonical vector
+        # base name 'dust1v' so that vectors are loaded/stored consistently.
+        normalized = []
+        for f in fields:
+            if isinstance(f, str) and len(f) > 1 and f[-1] in ("x", "y", "z"):
+                # If base exists as a vector (has component files), prefer it
+                base = f[:-1]
+                try:
+                    # Delegate detection to Simulation helper
+                    ftype = self.sim._infer_field_type(base, snapshot=(0 if self.snapshot is None else (self.snapshot[0] if isinstance(self.snapshot, list) else self.snapshot)))
+                    if ftype == 'vector':
+                        f = base
+                except Exception:
+                    pass
+            if f not in normalized:
+                normalized.append(f)
+
+        self.fields = normalized
         self.slice = slice
 
         # Convert snapshot into list - handle int, numpy types, and iterables
         if snapshots is None:
-            snapshots = [0]
+            if getattr(self.sim.vars, 'DIM', 3) == 2:
+                latest_snapshot = max(getattr(self.sim, 'nsnaps', 1) - 1, 0)
+                snapshots = [latest_snapshot]
+            else:
+                snapshots = [0]
         elif isinstance(snapshots, (int, np.integer)):
             snapshots = [int(snapshots)]
         elif not isinstance(snapshots, list):
@@ -1011,23 +1050,46 @@ class FieldInterpolator(fargopy.Fargobj):
 
                     data_slice, mesh = raw_field.meshslice(slice=slice)
 
-                    if (
-                        raw_field.type == 'vector'
-                        and getattr(self.sim.vars, 'DIM', 3) == 2
-                        and getattr(raw_field, 'coordinates', None) == 'polar'
-                        and coords == 'cartesian'
-                    ):
-                        phi_mesh = np.asarray(mesh.x)
-                        vphi = np.asarray(data_slice[0])
-                        vr = np.asarray(data_slice[1])
-                        if data_slice.shape[0] > 2:
-                            vz = np.asarray(data_slice[2])
-                        else:
-                            vz = np.zeros_like(vr)
+                    if raw_field.type == 'vector' and coords == 'cartesian' and getattr(raw_field, 'coordinates', None) != 'cartesian':
+                        source_coords = getattr(raw_field, 'coordinates', None)
 
-                        vx = vr * np.cos(phi_mesh) - vphi * np.sin(phi_mesh)
-                        vy = vr * np.sin(phi_mesh) + vphi * np.cos(phi_mesh)
-                        data_slice = np.array([vx, vy, vz])
+                        if source_coords == 'polar':
+                            phi_mesh = np.asarray(mesh.x)
+                            vphi = np.asarray(data_slice[0])
+                            vr = np.asarray(data_slice[1])
+                            if data_slice.shape[0] > 2:
+                                vz = np.asarray(data_slice[2])
+                            else:
+                                vz = np.zeros_like(vr)
+
+                            vx = vr * np.cos(phi_mesh) - vphi * np.sin(phi_mesh)
+                            vy = vr * np.sin(phi_mesh) + vphi * np.cos(phi_mesh)
+                            data_slice = np.array([vx, vy, vz])
+
+                        elif source_coords == 'cylindrical':
+                            phi_mesh = np.asarray(mesh.phi)
+                            vphi = np.asarray(data_slice[0])
+                            vr = np.asarray(data_slice[1])
+                            if data_slice.shape[0] > 2:
+                                vz = np.asarray(data_slice[2])
+                            else:
+                                vz = np.zeros_like(vr)
+
+                            vx = vr * np.cos(phi_mesh) - vphi * np.sin(phi_mesh)
+                            vy = vr * np.sin(phi_mesh) + vphi * np.cos(phi_mesh)
+                            data_slice = np.array([vx, vy, vz])
+
+                        elif source_coords == 'spherical':
+                            phi_mesh = np.asarray(mesh.phi)
+                            theta_mesh = np.asarray(mesh.theta)
+                            vphi = np.asarray(data_slice[0])
+                            vr = np.asarray(data_slice[1])
+                            vtheta = np.asarray(data_slice[2]) if data_slice.shape[0] > 2 else np.zeros_like(vr)
+
+                            vx = vr * np.sin(theta_mesh) * np.cos(phi_mesh) + vtheta * np.cos(theta_mesh) * np.cos(phi_mesh) - vphi * np.sin(phi_mesh)
+                            vy = vr * np.sin(theta_mesh) * np.sin(phi_mesh) + vtheta * np.cos(theta_mesh) * np.sin(phi_mesh) + vphi * np.cos(phi_mesh)
+                            vz = vr * np.cos(theta_mesh) - vtheta * np.sin(theta_mesh)
+                            data_slice = np.array([vx, vy, vz])
 
                     if not coords_assigned:
                         _assign_2d_coords(row, mesh)
@@ -1435,8 +1497,12 @@ class FieldInterpolator(fargopy.Fargobj):
         slice = slice or self.slice
         slice_ranges = self._slice_ranges or self._parse_slice_ranges(slice)
         
-        # Get coordinate system
-        coords = self.sim.vars.COORDINATES if hasattr(self.sim, 'vars') else 'spherical'
+        # Interpret query points in the coordinate system used when the field was loaded.
+        # This matters for 2D Fargo3D outputs that can be loaded as native polar meshes
+        # or as transformed cartesian X/Y meshes.
+        coords = getattr(self, '_original_coords', None)
+        if coords is None:
+            coords = self.sim.vars.COORDINATES if hasattr(self.sim, 'vars') else 'spherical'
         
         r_bounds = slice_ranges.get('r')
         theta_bounds = slice_ranges.get('theta')
@@ -1477,6 +1543,34 @@ class FieldInterpolator(fargopy.Fargobj):
 
         if ndim == 2:
             # Handle 2D slices based on coordinate system
+            if coords == 'cartesian':
+                # The simulation is still a polar disk; the cartesian load only
+                # changes how the mesh is presented to the interpolator.
+                x = xi[:, 0]
+                y = xi[:, 1]
+                r = np.sqrt(x**2 + y**2)
+                phi = np.arctan2(y, x)
+                r_min_native = self.sim.domains.r.min()
+                r_max_native = self.sim.domains.r.max()
+                phi_axis = np.asarray(self.sim.domains.phi)
+                phi_min_native = phi_axis.min()
+                phi_max_native = phi_axis.max()
+                phi_step = phi_axis[1] - phi_axis[0] if phi_axis.size > 1 else 0.0
+                phi_span = phi_max_native - phi_min_native
+                full_circle = phi_axis.size > 1 and phi_span >= (2 * np.pi - 2 * abs(phi_step))
+                if full_circle:
+                    phi = (phi - phi_min_native) % (2 * np.pi) + phi_min_native
+                elif phi_min_native >= 0:
+                    phi = np.mod(phi, 2 * np.pi)
+                r_mask = (r >= r_min_native - eps) & (r <= r_max_native + eps)
+                if full_circle:
+                    phi_mask = np.ones_like(phi, dtype=bool)
+                elif phi_min_native <= phi_max_native:
+                    phi_mask = (phi >= phi_min_native - eps) & (phi <= phi_max_native + eps)
+                else:
+                    phi_mask = (phi >= phi_min_native - eps) | (phi <= phi_max_native + eps)
+                return r_mask & phi_mask
+
             if coords == 'polar':
                 phi = xi[:, 0]
                 r = xi[:, 1]
@@ -1486,21 +1580,21 @@ class FieldInterpolator(fargopy.Fargobj):
 
             if coords == 'spherical':
                 # XY plane: theta fixed
+                # In spherical coordinates the free axes are (phi, r) for a theta-slice
                 if slice is not None and 'theta' in slice:
-                    # XY plane: z = 0, theta fixed, filter by r and phi
-                    x, y = xi[:, 0], xi[:, 1]
-                    r = np.sqrt(x**2 + y**2)
-                    phi = np.arctan2(y, x)
+                    # xi columns are (phi, r)
+                    phi = xi[:, 0]
+                    r = xi[:, 1]
                     r_ge, r_le = _bounded(r, r_bounds, (r_min, r_max))
                     mask = r_ge & r_le & _phi_in_bounds(phi)
                     return mask
-                
+
                 # XZ plane: phi fixed
                 elif slice is not None and 'phi' in slice:
-                    # XZ plane: y = 0, phi fixed, filter by r and theta
-                    x, z = xi[:, 0], xi[:, 1]
-                    r = np.sqrt(x**2 + z**2)
-                    theta = np.arccos(z / np.clip(r, 1e-14, None))
+                    # For a phi-slice the free axes are (r, theta)
+                    # xi columns are (r, theta)
+                    r = xi[:, 0]
+                    theta = xi[:, 1]
                     r_ge, r_le = _bounded(r, r_bounds, (r_min, r_max))
                     if theta_bounds:
                         lo, hi = theta_bounds
@@ -1512,10 +1606,9 @@ class FieldInterpolator(fargopy.Fargobj):
                         )
                     return r_ge & r_le & theta_mask
                 else:
-                    # Default: treat as XY (theta fixed)
-                    x, y = xi[:, 0], xi[:, 1]
-                    r = np.sqrt(x**2 + y**2)
-                    phi = np.arctan2(y, x)
+                    # Default: assume (phi, r)
+                    phi = xi[:, 0]
+                    r = xi[:, 1]
                     mask = (r > r_min) & (r < r_max)
                     return mask
                     
@@ -1643,11 +1736,11 @@ class FieldInterpolator(fargopy.Fargobj):
             return mask
 
     def evaluate(
-            self, var1, snapshot=None, time=None, var2=None, var3=None, dataframe=None,
-            interpolator="griddata", method="linear",
-            rbf_kwargs=None, griddata_kwargs=None, idw_kwargs=None,
-            sigma_smooth=None, field=None, reflect=False, coords=None
-        ):
+        self, var1=None, snapshot=None, time=None, var2=None, var3=None, dataframe=None,
+        interpolator="griddata", method="linear",
+        rbf_kwargs=None, griddata_kwargs=None, idw_kwargs=None,
+        sigma_smooth=None, field=None, reflect=False, coords=None
+    ):
         """
         Evaluate the selected field at arbitrary spatial coordinates using
         multi-snapshot interpolation. Supports scalar and vector fields,
@@ -1662,24 +1755,24 @@ class FieldInterpolator(fargopy.Fargobj):
         var1, var2, var3 : array-like or float
             Evaluation coordinates. For 3D: typically (x, y, z) if coords='cartesian',
             (phi, r, theta) if coords='spherical', or (phi, r, z) if coords='cylindrical'.
-            The coordinate system is determined by the 'coords' parameter.
-            Scalars are accepted.
+            For sliced 2D data, the fixed coordinate can be omitted and will be inferred
+            from the loaded slice when possible. Scalars are accepted.
 
         dataframe : pandas.DataFrame, optional
             Custom DataFrame. If omitted, self.df is used.
 
         interpolator : {"griddata", "rbf", "linearnd", "idw", "regular_grid"}, default "griddata"
             Backend used for spatial interpolation:
-            - "griddata": scipy.interpolate.griddata (default, works for irregular grids)
-            - "rbf": Radial Basis Function interpolation
-            - "linearnd": LinearNDInterpolator
-            - "idw": Inverse Distance Weighting
-            - "regular_grid": scipy.interpolate.RegularGridInterpolator (automatic for
-              3D regular grids, fastest option when applicable)
-            
-            Note: For 3D data with regular grid structure, RegularGridInterpolator is
-            automatically used by default regardless of the interpolator setting, with
-            automatic fallback to griddata if the grid is irregular.
+        - "griddata": scipy.interpolate.griddata (default, works for irregular grids)
+        - "rbf": Radial Basis Function interpolation
+        - "linearnd": LinearNDInterpolator
+        - "idw": Inverse Distance Weighting
+        - "regular_grid": scipy.interpolate.RegularGridInterpolator (automatic for
+          3D regular grids, fastest option when applicable)
+        
+        Note: For 3D data with regular grid structure, RegularGridInterpolator is
+        automatically used by default regardless of the interpolator setting, with
+        automatic fallback to griddata if the grid is irregular.
 
         method : str, default "linear"
             Kernel/method used by backend (e.g., 'linear', 'cubic' for griddata).
@@ -1711,6 +1804,7 @@ class FieldInterpolator(fargopy.Fargobj):
             If None (default), uses the original coordinate system from load_data.
             
             - "cartesian": var1=x, var2=y, var3=z
+            - "polar": var1=phi, var2=r (native 2D polar data)
             - "spherical": var1=phi, var2=r, var3=theta
             - "cylindrical": var1=phi, var2=r, var3=z
             
@@ -1734,6 +1828,11 @@ class FieldInterpolator(fargopy.Fargobj):
         
         >>> loader.evaluate(var1=phi_vals, var2=r_vals, var3=theta_vals,
         ...                 field='gasdens', time=0.5, coords='spherical')
+
+        Evaluate native 2D polar data:
+
+        >>> loader.evaluate(var1=phi_vals, var2=r_vals,
+        ...                 field='gasdens', time=0.5, coords='polar')
 
         Notes
         -----
@@ -1800,6 +1899,16 @@ class FieldInterpolator(fargopy.Fargobj):
         field_name = field_col[:-5] if field_col.endswith("_mesh") else field_col
         field_type = getattr(self, "_field_types", {}).get(field_name)
 
+        def _vector_component_count(sample):
+            sample_array = np.asarray(sample)
+            if sample_array.ndim == 0:
+                return 1
+            if sample_array.shape[0] in (2, 3):
+                return sample_array.shape[0]
+            if sample_array.shape[-1] in (2, 3):
+                return sample_array.shape[-1]
+            return 3
+
         # ===============================================================
         # Prepare snapshot ordering
         # ===============================================================
@@ -1807,17 +1916,32 @@ class FieldInterpolator(fargopy.Fargobj):
         times = df_sorted["time"].values
         nsnaps = len(times)
 
-        # Detect scalar inputs
-        is_scalar = (
-            np.isscalar(var1)
-            and (var2 is None or np.isscalar(var2))
-            and (var3 is None or np.isscalar(var3))
-        )
-        result_shape = () if is_scalar else np.asarray(var1).shape
+        vector_ncomp = 1
+        if field_type == "vector" and len(df_sorted) > 0:
+            try:
+                vector_ncomp = _vector_component_count(df_sorted.iloc[0][field_col])
+            except Exception:
+                vector_ncomp = 3
 
-        if np.isscalar(var1): var1 = np.array([var1])
-        if np.isscalar(var2): var2 = np.array([var2])
-        if np.isscalar(var3): var3 = np.array([var3])
+        # Detect scalar inputs
+        def _as_query_array(value):
+            if value is None:
+                return None
+            array = np.asarray(value)
+            if array.ndim == 0:
+                return array.reshape(1)
+            return array
+
+        query_values = [var1, var2, var3]
+        template = next((value for value in query_values if value is not None and np.asarray(value).ndim > 0), None)
+        if template is None:
+            template = next((value for value in query_values if value is not None), None)
+        is_scalar = all(value is None or np.asarray(value).ndim == 0 for value in query_values)
+        result_shape = () if is_scalar or template is None else np.asarray(template).shape
+
+        var1 = _as_query_array(var1)
+        var2 = _as_query_array(var2)
+        var3 = _as_query_array(var3)
 
         if self.dim == 2 and coords_original == 'polar':
             if var2 is None:
@@ -1929,6 +2053,26 @@ class FieldInterpolator(fargopy.Fargobj):
                 return phi, r_cyl, z
             else:
                 raise ValueError(f"Unknown coordinate system: {to_system}")
+
+        def _infer_2d_axis_layout(cx, cy, cz):
+            """Infer which axis is fixed in a 2D slice from the loaded meshes."""
+            meshes = [np.asarray(cx), np.asarray(cy), np.asarray(cz)]
+            spreads = [np.ptp(mesh) for mesh in meshes]
+            fixed_axis = int(np.argmin(spreads))
+
+            if not np.isfinite(spreads[fixed_axis]) or spreads[fixed_axis] > 1e-12:
+                fallback = {
+                    'theta': 2,
+                    'phi': 0,
+                    'r': 1,
+                    'z': 2,
+                }.get(slice_type)
+                if fallback is None:
+                    return None, None
+                fixed_axis = fallback
+
+            free_axes = tuple(axis for axis in range(3) if axis != fixed_axis)
+            return fixed_axis, free_axes
 
         # ===============================================================
         # Interpolation backends
@@ -2059,7 +2203,6 @@ class FieldInterpolator(fargopy.Fargobj):
             coords = np.asarray(coords)
             values = np.asarray(values).ravel()
             xi = np.asarray(xi)
-
             mask = self._domain_mask(xi)
             if reflect:
                 mask = np.ones(xi.shape[0], dtype=bool)
@@ -2133,6 +2276,22 @@ class FieldInterpolator(fargopy.Fargobj):
             cy = np.array(row["var2_mesh"])
             cz = np.array(row["var3_mesh"])
 
+            fixed_axis = None
+            free_axes = None
+            if self.dim == 2:
+                fixed_axis, free_axes = _infer_2d_axis_layout(cx, cy, cz)
+                if free_axes is None:
+                    raise ValueError("Could not infer the varying axes for this 2D slice.")
+
+            query_var1, query_var2, query_var3 = var1, var2, var3
+            if self.dim == 2 and fixed_axis is not None:
+                if fixed_axis == 0 and query_var1 is None:
+                    query_var1 = np.asarray(cx).ravel()[0]
+                elif fixed_axis == 1 and query_var2 is None:
+                    query_var2 = np.asarray(cy).ravel()[0]
+                elif fixed_axis == 2 and query_var3 is None:
+                    query_var3 = np.asarray(cz).ravel()[0]
+
             # =========================================================
             # COORDINATE TRANSFORMATION (SIMPLIFIED)
             # =========================================================
@@ -2140,12 +2299,12 @@ class FieldInterpolator(fargopy.Fargobj):
             # Default: use coordinates as-is (no transformation)
             if (coords is not None and 
                 coords_target != coords_original and 
-                var1 is not None):
+                query_var1 is not None):
                 # User explicitly requested different coordinate system
                 try:
-                    var1_eval = var1
-                    var2_eval = var2 if var2 is not None else np.zeros_like(var1)
-                    var3_eval = var3 if var3 is not None else np.zeros_like(var1)
+                    var1_eval = query_var1
+                    var2_eval = query_var2 if query_var2 is not None else np.zeros_like(var1_eval)
+                    var3_eval = query_var3 if query_var3 is not None else np.zeros_like(var1_eval)
                     
                     # Transform coordinates
                     var1_transformed, var2_transformed, var3_transformed = transform_coords(
@@ -2158,14 +2317,45 @@ class FieldInterpolator(fargopy.Fargobj):
                     var3_use = var3_transformed
                 except Exception as e:
                     # If transformation fails, use original coordinates
-                    var1_use = var1
-                    var2_use = var2
-                    var3_use = var3
+                    var1_use = query_var1
+                    var2_use = query_var2
+                    var3_use = query_var3
             else:
                 # No transformation needed - use original coordinates
-                var1_use = var1
-                var2_use = var2
-                var3_use = var3
+                var1_use = query_var1
+                var2_use = query_var2
+                var3_use = query_var3
+
+            # Determine minimal required coordinates depending on slice dimensionality
+            query_axes = [var1_use, var2_use, var3_use]
+
+            if self.dim == 3:
+                if any(a is None for a in query_axes):
+                    raise ValueError("3D interpolation requires var1, var2 and var3.")
+
+            elif self.dim == 2:
+                # require the two free axes to be provided
+                if any(query_axes[fa] is None for fa in free_axes):
+                    raise ValueError("2D interpolation requires coordinates for the two free axes.")
+
+            elif self.dim == 1:
+                # For 1D slices, accept var1 as the free variable for backward compatibility.
+                # Infer which axis is free (max spread) and map var1 to it if needed.
+                spreads = [np.ptp(np.asarray(cx)), np.ptp(np.asarray(cy)), np.ptp(np.asarray(cz))]
+                free_axis = int(np.argmax(spreads))
+                if query_axes[free_axis] is None:
+                    # If user provided only var1, use it as the free axis
+                    if var1 is not None and (var2 is None and var3 is None):
+                        query_axes[free_axis] = np.asarray(var1)
+                    else:
+                        raise ValueError("1D interpolation requires a coordinate for the free axis.")
+
+            # Broadcast arrays for interpolation (fill scalars as needed)
+            var1_use, var2_use, var3_use = (
+                np.asarray(query_axes[0]),
+                np.asarray(query_axes[1]),
+                np.asarray(query_axes[2]),
+            )
 
             # Build coordinate arrays
             if self.dim == 3:
@@ -2319,28 +2509,20 @@ class FieldInterpolator(fargopy.Fargobj):
                             
                             return result_rg
             elif self.dim == 2:
-                # Detect coordinate system
-                coords_sys = self.sim.vars.COORDINATES if hasattr(self.sim, 'vars') else 'spherical'
-
-                if coords_sys == 'polar':
-                    points_array = np.column_stack((cx.ravel(), cy.ravel()))
-                    xi = np.column_stack((var1_use.ravel(), var2_use.ravel()))
-                elif coords_sys == 'spherical':
-                    # Determine which plane we're working with
-                    # Spherical: theta=const → XY plane, phi=const → XZ plane
-                    if slice_type == "theta":
-                        points_array = np.column_stack((cx.ravel(), cy.ravel()))
-                        xi = np.column_stack((var1_use.ravel(), var2_use.ravel()))
-                    else:  # phi or r
-                        points_array = np.column_stack((cx.ravel(), cz.ravel()))
-                        xi = np.column_stack((var1_use.ravel(), var3_use.ravel()))
-                else:  # cylindrical
-                    if slice_type == "z":
-                        points_array = np.column_stack((cx.ravel(), cy.ravel()))
-                        xi = np.column_stack((var1_use.ravel(), var2_use.ravel()))
-                    else:  # phi or r
-                        points_array = np.column_stack((cx.ravel(), cz.ravel()))
-                        xi = np.column_stack((var1_use.ravel(), var3_use.ravel()))
+                mesh_axes = [cx, cy, cz]
+                query_axes = [var1_use, var2_use, var3_use]
+                points_array = np.column_stack(
+                    (
+                        np.asarray(mesh_axes[free_axes[0]]).ravel(),
+                        np.asarray(mesh_axes[free_axes[1]]).ravel(),
+                    )
+                )
+                xi = np.column_stack(
+                    (
+                        np.asarray(query_axes[free_axes[0]]).ravel(),
+                        np.asarray(query_axes[free_axes[1]]).ravel(),
+                    )
+                )
             elif self.dim == 1:
                 if coords_original == 'polar':
                     if slice_type == 'phi':
@@ -2358,18 +2540,102 @@ class FieldInterpolator(fargopy.Fargobj):
             # UNIVERSAL VECTOR COMPONENT SELECTOR
             # -------------------------------------------
             if isinstance(data, np.ndarray) and comp is not None:
-                if data.ndim == 2 and data.shape[0] == 3:
+                if data.ndim == 2 and data.shape[0] in (2, 3):
                     data = data[comp]
-                elif data.ndim == 2 and data.shape[1] == 3:
+                elif data.ndim == 2 and data.shape[1] in (2, 3):
                     data = data[:, comp]
-                elif data.ndim == 3 and data.shape[0] == 3:
+                elif data.ndim == 3 and data.shape[0] in (2, 3):
                     data = data[comp].ravel()
-                elif data.ndim == 4 and data.shape[0] == 3:
+                elif data.ndim == 4 and data.shape[0] in (2, 3):
                     data = data[comp].ravel()
-                elif data.ndim == 4 and data.shape[-1] == 3:
+                elif data.ndim == 4 and data.shape[-1] in (2, 3):
                     data = data[..., comp].ravel()
                 else:
                     raise ValueError(f"Cannot extract vector component from {data.shape}")
+
+            # Fast path for native 2D Fargo3D outputs. These simulations are
+            # stored on a structured polar grid even when the field is exposed
+            # to the user as cartesian X/Y meshes.
+            if (
+                self.dim == 2
+                and getattr(self.sim.vars, 'DIM', 3) == 2
+                and slice_type is None
+                and not reflect
+                and isinstance(data, np.ndarray)
+                and data.ndim == 2
+            ):
+                slice_ranges = self._slice_ranges or self._parse_slice_ranges(self.slice)
+                if slice_ranges.get('r') is not None or slice_ranges.get('phi') is not None:
+                    # Sliced domains have reduced axes; fall back to generic interpolator.
+                    pass
+                else:
+                    r_axis = np.asarray(self.sim.domains.r)
+                    phi_axis = np.asarray(self.sim.domains.phi)
+
+                    if coords_original == 'polar':
+                        query_r = np.asarray(var2_use).ravel()
+                        query_phi = np.asarray(var1_use).ravel()
+                    else:
+                        query_x = np.asarray(var1_use).ravel()
+                        query_y = np.asarray(var2_use).ravel()
+                        query_r = np.sqrt(query_x**2 + query_y**2)
+                        query_phi = np.arctan2(query_y, query_x)
+
+                    if phi_axis.size > 1:
+                        phi_step = phi_axis[1] - phi_axis[0]
+                        phi_span = phi_axis[-1] - phi_axis[0]
+                        full_circle = phi_span >= (2 * np.pi - 2 * abs(phi_step))
+                        if full_circle:
+                            phi0 = phi_axis[0]
+                            query_phi = (query_phi - phi0) % (2 * np.pi) + phi0
+
+                    edges = getattr(self.sim.domains, 'edges', None)
+                    if edges is not None and isinstance(edges, dict):
+                        r_bounds = edges['r'] if edges.get('r') is not None else r_axis
+                        phi_bounds = edges['phi'] if edges.get('phi') is not None else phi_axis
+                    else:
+                        r_bounds = r_axis
+                        phi_bounds = phi_axis
+                    r_min_plot, r_max_plot = np.min(r_bounds), np.max(r_bounds)
+                    phi_min_plot, phi_max_plot = np.min(phi_bounds), np.max(phi_bounds)
+                    eps = 1e-7
+                    mask_valid = (query_r >= r_min_plot - eps) & (query_r <= r_max_plot + eps)
+                    if phi_axis.size > 1 and not full_circle:
+                        if phi_min_plot <= phi_max_plot:
+                            phi_mask = (query_phi >= phi_min_plot - eps) & (query_phi <= phi_max_plot + eps)
+                        else:
+                            phi_mask = (query_phi >= phi_min_plot - eps) | (query_phi <= phi_max_plot + eps)
+                        mask_valid &= phi_mask
+
+                    # Roundoff on coordinates reconstructed from the same grid can
+                    # push boundary points slightly outside the valid radius range.
+                    # Clamp the query radius to the native domain before interpolation.
+                    if query_r.size:
+                        query_r = np.clip(query_r, r_axis[0], r_axis[-1])
+
+                    # Fargo3D 2D outputs are periodic in phi. Extend the grid by one cell
+                    # on both sides so queries near the branch cut (x < 0 axis in cartesian)
+                    # can interpolate across the periodic seam instead of becoming NaN.
+                    if phi_axis.size > 1:
+                        phi_step = phi_axis[1] - phi_axis[0]
+                        phi_axis = np.concatenate(
+                            ([phi_axis[0] - phi_step], phi_axis, [phi_axis[-1] + phi_step])
+                        )
+                        data = np.concatenate((data[:, -1:], data, data[:, :1]), axis=1)
+
+                    query_points = np.column_stack((query_r, query_phi))
+
+                    interp_obj = RegularGridInterpolator(
+                        (r_axis, phi_axis),
+                        np.asarray(data),
+                        method=method if method in ['linear', 'nearest'] else 'linear',
+                        bounds_error=False,
+                        fill_value=np.nan,
+                    )
+                    fast_result = interp_obj(query_points)
+                    if mask_valid is not None:
+                        fast_result = np.where(mask_valid, fast_result, np.nan)
+                    return fast_result.item() if is_scalar else fast_result.reshape(result_shape)
 
             if self.dim == 1:
                 points_1d = np.asarray(points_array).ravel()
@@ -2489,11 +2755,16 @@ class FieldInterpolator(fargopy.Fargobj):
         # ===============================================================
         if nsnaps == 1:
             if field_type == "vector":
-                vals = [interp(0, field, c) for c in range(3)]
-                arr = np.array([v.item() if is_scalar else v.reshape(result_shape) for v in vals])
+                vals = [interp(0, field, c) for c in range(vector_ncomp)]
+                def _to_out(v):
+                    a = np.asarray(v)
+                    return a.item() if is_scalar else a.reshape(result_shape)
+                arr = np.array([_to_out(v) for v in vals])
                 return _smooth(arr)
             v = interp(0, field)
-            return _smooth(v.item() if is_scalar else v.reshape(result_shape))
+            a = np.asarray(v)
+            out = a.item() if is_scalar else a.reshape(result_shape)
+            return _smooth(out)
 
         # Two snapshots
         if nsnaps == 2:
@@ -2508,7 +2779,7 @@ class FieldInterpolator(fargopy.Fargobj):
                 return (1 - fac) * v0 + fac * v1
 
             if field_type == "vector":
-                vals = [blend(c) for c in range(3)]
+                vals = [blend(c) for c in range(vector_ncomp)]
                 arr = np.array([v.item() if is_scalar else v.reshape(result_shape) for v in vals])
                 return _smooth(arr)
 
@@ -2529,7 +2800,7 @@ class FieldInterpolator(fargopy.Fargobj):
             return (1 - fac) * v0 + fac * v1
 
         if field_type == "vector":
-            vals = [blend(c) for c in range(3)]
+            vals = [blend(c) for c in range(vector_ncomp)]
             arr = np.array([v.item() if is_scalar else v.reshape(result_shape) for v in vals])
             return _smooth(arr)
 

@@ -50,6 +50,12 @@ class Plot(object):
         >>> ax.plot([1, 2, 3], [1, 2, 3])
         >>> fp.Plot.fargopy_mark(ax)
         """
+        ax.grid(False, which="both")
+        try:
+            ax.minorticks_off()
+        except Exception:
+            pass
+
         # Get the height of axe
         axh = (
             ax.get_window_extent()
