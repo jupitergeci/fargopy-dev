@@ -3,7 +3,7 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox, QCheckBox, QLineEdit,
     QGridLayout, QSpinBox, QDoubleSpinBox, QGroupBox, QFrame, QSizePolicy, QFileDialog,
-    QDialog, QTextEdit, QFormLayout, QDialogButtonBox
+    QDialog, QTextEdit, QFormLayout, QDialogButtonBox, QScrollArea
 )
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont, QIcon, QPixmap, QColor
@@ -13,7 +13,6 @@ from matplotlib.figure import Figure
 import sys
 import fargopy as fp
 import matplotlib as plt
-plt.style.use('seaborn-v0_8-whitegrid')
 from matplotlib.animation import FuncAnimation
 from matplotlib.animation import FFMpegWriter
 import os
@@ -21,6 +20,7 @@ import re
 import subprocess
 import traceback
 from datetime import datetime
+from collections import OrderedDict
 
 CMAP_GROUPS = [
     ('Perc Unif Sequ', [
@@ -83,13 +83,45 @@ def populate_cmap_combo(combo: QComboBox, default: str = None):
 def populate_field_combo(combo: QComboBox, fields, default: str = None):
     """Populate a combo box with detected field names."""
     combo.clear()
-    combo.addItem("")
+    # Normalize field names: strip trailing snapshot digits and
+    # collapse component-suffixed names (vx, vy, vz) to their base (e.g. gasv)
+    seen = []
+    # Names to ignore (non-field files)
+    exclude_bases = {'summary', 'planet', 'bigplanet', 'output', 'tqwk', 'orbir', 'orbit', 'bigplanet'}
     for field_name in sorted(fields):
-        combo.addItem(field_name)
-    if default and default in fields:
-        combo.setCurrentText(default)
+        # Strip trailing digits
+        base = re.sub(r"\d+$", "", field_name)
+        # If ends with component letter, reduce to vector base
+        if base and base[-1] in ('x', 'y', 'z'):
+            candidate = base[:-1]
+            if candidate:
+                base = candidate
+        if not base:
+            continue
+        if base in exclude_bases:
+            continue
+        if base and base not in seen:
+            seen.append(base)
+    # Keep an empty placeholder as first item
+    combo.addItem("")
+    for fname in seen:
+        combo.addItem(fname)
+    # If a default was provided and exists, select it. Otherwise select first real field.
+    # Try to restore requested default (normalize it first)
+    if default:
+        norm_def = re.sub(r"\d+$", "", default)
+        if norm_def and norm_def.endswith(('x', 'y', 'z')):
+            norm_def = norm_def[:-1]
+        if norm_def and norm_def in seen:
+            combo.setCurrentText(norm_def)
+            return
+    # Otherwise select first real field if available
+    if seen:
+        try:
+            combo.setCurrentIndex(1)
+        except Exception:
+            combo.setCurrentText(seen[0])
 
-MAP_TYPES = ['Density', 'Energy', 'Velocity']
 VELOCITY_COMPONENTS = ['vx', 'vy', 'vz']
 VEL_INDEX = {'vx': 0, 'vy': 1, 'vz': 2}
 
@@ -214,7 +246,7 @@ class SimInfoDialog(QDialog):
         # Buttons
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Apply)
         layout.addRow(buttons)
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._on_ok)
         buttons.button(QDialogButtonBox.Apply).clicked.connect(self.apply_changes)
 
         # Reset units button
@@ -226,6 +258,14 @@ class SimInfoDialog(QDialog):
         self.units_combo.currentTextChanged.connect(self.apply_unitsystem)
         self.ul_unit_combo.currentTextChanged.connect(self.update_ul_display)
         self.um_unit_combo.currentTextChanged.connect(self.update_um_display)
+
+
+    def _is_polar_2d(self):
+        return bool(
+            self.sim
+            and getattr(getattr(self.sim, "vars", None), "DIM", 3) == 2
+            and getattr(getattr(self.sim, "vars", None), "COORDINATES", "").lower() == "polar"
+        )
 
     def update_ul_display(self):
         ul = getattr(self.sim, "UL", 1.0)
@@ -314,15 +354,47 @@ class SimInfoDialog(QDialog):
         except Exception as e:
             self.info_text.setText(f"Error loading properties:\n{e}")
 
+    def _apply_units_to_sim(self, unitsys, ul=None, um=None):
+        # Keep fargopy's unit system and the explicit scale factors synchronized.
+        unitsys_lower = str(unitsys).lower()
+        try:
+            self.sim.units(unitsys_lower)
+        except Exception:
+            pass
+        try:
+            self.sim.unitsystem = unitsys_lower
+        except Exception:
+            pass
+        if ul is not None:
+            try:
+                self.sim.UL = ul
+            except Exception:
+                pass
+        if um is not None:
+            try:
+                self.sim.UM = um
+            except Exception:
+                pass
+        try:
+            kwargs = {}
+            if ul is not None:
+                kwargs["UL"] = ul
+            if um is not None:
+                kwargs["UM"] = um
+            if kwargs:
+                self.sim.set_units(**kwargs)
+        except Exception:
+            pass
+
     def apply_unitsystem(self, text):
-        self.sim.units(text.lower())
+        self._apply_units_to_sim(text)
         self.ul_spin.setValue(getattr(self.sim, "UL", 1.0))
         self.um_spin.setValue(getattr(self.sim, "UM", 1.0))
         self.update_ul_display()
         self.update_um_display()
         self.update_info_text()
         if self.parent() and hasattr(self.parent(), "plot_density"):
-            self.parent().plot_density(self.units_combo.currentText())
+            self.parent().plot_density()
 
     def apply_changes(self):
         unitsys = self.units_combo.currentText()
@@ -368,16 +440,19 @@ class SimInfoDialog(QDialog):
         else:
             um = um_val
 
-        self.sim.set_units(UL=ul, UM=um)
+        self._apply_units_to_sim(unitsys, ul=ul, um=um)
         self.update_ul_display()
         self.update_um_display()
         self.update_info_text()
         if self.parent() and hasattr(self.parent(), "plot_density"):
-            self.parent().plot_density(self.units_combo.currentText())
+            self.parent().plot_density()
+
+    def _on_ok(self):
+        self.apply_changes()
+        self.accept()
 
     def reset_units(self):
-        self.sim.units(str(self.initial_unitsystem).lower())
-        self.sim.set_units(UL=self.initial_UL, UM=self.initial_UM)
+        self._apply_units_to_sim(self.initial_unitsystem, ul=self.initial_UL, um=self.initial_UM)
         self.units_combo.setCurrentText(str(self.initial_unitsystem).upper())
         self.ul_spin.setValue(self.initial_UL)
         self.um_spin.setValue(self.initial_UM)
@@ -385,7 +460,7 @@ class SimInfoDialog(QDialog):
         self.update_um_display()
         self.update_info_text()
         if self.parent() and hasattr(self.parent(), "plot_density"):
-            self.parent().plot_density(self.units_combo.currentText())
+            self.parent().plot_density()
 
 class PlotOptionsDialog(QDialog):
     def __init__(self, parent):
@@ -406,19 +481,24 @@ class PlotOptionsDialog(QDialog):
         populate_cmap_combo(self.stream_cmap_dropdown)
         layout.addRow("Streamlines colormap:", self.stream_cmap_dropdown)
 
-        # Map type
+        # Main field selector
         self.map_dropdown = QComboBox()
-        self.map_dropdown.addItems(MAP_TYPES)
-        layout.addRow("Map type:", self.map_dropdown)
+        layout.addRow("Field:", self.map_dropdown)
 
-        # Field override
+        # Hidden legacy field selector kept only for compatibility with the
+        # existing plotting logic, which still synchronizes parent.field_dropdown.
         self.field_dropdown = QComboBox()
         layout.addRow("Field override:", self.field_dropdown)
+        try:
+            layout.labelForField(self.field_dropdown).setVisible(False)
+        except Exception:
+            pass
+        self.field_dropdown.setVisible(False)
 
-        # Velocity component
+        # Field component
         self.vel_dropdown = QComboBox()
         self.vel_dropdown.addItems(VELOCITY_COMPONENTS)
-        layout.addRow("Velocity component:", self.vel_dropdown)
+        layout.addRow("Field component:", self.vel_dropdown)
 
         # Fixed colorbar
         self.fixed_cbar_checkbox = QCheckBox("Fixed colorbar range")
@@ -469,7 +549,7 @@ class PlotOptionsDialog(QDialog):
         # Buttons
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Apply)
         layout.addRow(buttons)
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._on_ok)
         buttons.button(QDialogButtonBox.Apply).clicked.connect(self.apply_changes)
 
         # Initialize values from parent
@@ -477,6 +557,7 @@ class PlotOptionsDialog(QDialog):
 
         # Connections
         self.map_dropdown.currentTextChanged.connect(self.on_map_change)
+        self.map_dropdown.currentTextChanged.connect(self._sync_field_dropdown_to_map)
         self.fixed_cbar_checkbox.stateChanged.connect(self.on_fixed_cbar_toggle)
         self.manual_vmin_vmax_checkbox.stateChanged.connect(self.on_manual_vmin_vmax_toggle)
         self.fixed_cbar_snap_spin.valueChanged.connect(self.on_fixed_cbar_snap_change)
@@ -485,13 +566,18 @@ class PlotOptionsDialog(QDialog):
         p = self.parent
         self.cmap_dropdown.setCurrentText(p.cmap_dropdown.currentText())
         self.stream_cmap_dropdown.setCurrentText(p.stream_cmap_dropdown.currentText())
-        self.map_dropdown.setCurrentText(p.map_dropdown.currentText())
+        populate_field_combo(self.map_dropdown, p.available_field_names(), p.map_dropdown.currentText())
         populate_field_combo(self.field_dropdown, p.available_field_names(), p.field_dropdown.currentText())
         self.vel_dropdown.setCurrentText(p.vel_dropdown.currentText())
         self.fixed_cbar_checkbox.setChecked(p.fixed_cbar_enabled)
         self.fixed_cbar_snap_spin.setMaximum(p.fixed_cbar_snap_spin.maximum())
         self.fixed_cbar_snap_spin.setValue(p.fixed_cbar_snap_spin.value())
-        self.vel_dropdown.setEnabled(self.map_dropdown.currentText() == 'Velocity')
+        # Enable component selector only for vector fields
+        try:
+            field_type = p.available_field_catalog().get(self.map_dropdown.currentText())
+            self.vel_dropdown.setEnabled(field_type == 'vector')
+        except Exception:
+            self.vel_dropdown.setEnabled(False)
         self.manual_vmin_vmax_checkbox.setChecked(p.manual_vmin_vmax_enabled)
         self.vmin_spin.setValue(p.manual_vmin)
         self.vmax_spin.setValue(p.manual_vmax)
@@ -510,8 +596,9 @@ class PlotOptionsDialog(QDialog):
         
         p.cmap_dropdown.setCurrentText(self.cmap_dropdown.currentText())
         p.stream_cmap_dropdown.setCurrentText(self.stream_cmap_dropdown.currentText())
-        p.map_dropdown.setCurrentText(self.map_dropdown.currentText())
-        p.field_dropdown.setCurrentText(self.field_dropdown.currentText())
+        selected_field = self.map_dropdown.currentText().strip()
+        p.map_dropdown.setCurrentText(selected_field)
+        p.field_dropdown.setCurrentText(selected_field)
         p.vel_dropdown.setCurrentText(self.vel_dropdown.currentText())
         p.fixed_cbar_enabled = self.fixed_cbar_checkbox.isChecked()
         p.fixed_cbar_snap_spin.setValue(self.fixed_cbar_snap_spin.value())
@@ -531,11 +618,16 @@ class PlotOptionsDialog(QDialog):
                 # Snapshot changed
                 need_recalc = True
             elif old_map_type != p.map_dropdown.currentText():
-                # Map type changed
+                # Field selection changed
                 need_recalc = True
-            elif old_map_type == 'Velocity' and old_vel_comp != p.vel_dropdown.currentText():
-                # Velocity component changed for Velocity map
-                need_recalc = True
+            else:
+                # If the previously selected field was a vector, and the velocity component changed
+                try:
+                    catalog = p.available_field_catalog()
+                    if catalog.get(old_map_type) == 'vector' and old_vel_comp != p.vel_dropdown.currentText():
+                        need_recalc = True
+                except Exception:
+                    pass
         
         if need_recalc:
             p.update_fixed_cbar_limits()
@@ -543,24 +635,34 @@ class PlotOptionsDialog(QDialog):
         p.plot_density()
         self.sync_from_parent()
 
+    def _sync_field_dropdown_to_map(self, text):
+        # Keep the hidden legacy selector synchronized with the visible field selector.
+        try:
+            if self.field_dropdown.currentText() != text:
+                self.field_dropdown.setCurrentText(text)
+        except Exception:
+            pass
+
     def on_map_change(self, text):
-        self.vel_dropdown.setEnabled(text == 'Velocity')
+        # Enable the component dropdown only when a vector field is selected
+        try:
+            field_type = self.parent.available_field_catalog().get(text)
+            self.vel_dropdown.setEnabled(field_type == 'vector')
+        except Exception:
+            self.vel_dropdown.setEnabled(False)
+
+    def _on_ok(self):
+        # Apply changes then close
+        self.apply_changes()
+        self.accept()
 
     def on_fixed_cbar_toggle(self, state):
-        # Notify parent to update when fixed colorbar setting changes
-        enabled = bool(state)
-        if enabled and not self.parent.fixed_cbar_enabled:
-            # Just enabled, recalculate
-            self.parent.fixed_cbar_enabled = True
-            self.parent.update_fixed_cbar_limits()
-        elif not enabled:
-            self.parent.fixed_cbar_enabled = False
-        # Don't plot here, let apply_changes handle it
+        # Only enable/disable dialog controls here. The parent state is updated by Apply/OK.
+        pass
 
     def on_fixed_cbar_snap_change(self, value):
-        # When snapshot changes, update parent's spin value
-        # Recalculation will happen in apply_changes
-        self.parent.fixed_cbar_snap_spin.setValue(value)
+        # Recalculation will happen in apply_changes. Do not mutate parent before Apply/OK.
+        pass
 
     def on_manual_vmin_vmax_toggle(self, state):
         enabled = bool(state)
@@ -681,8 +783,12 @@ class PlotInteractiveWindow(QWidget):
             pass
         self.stream_cmap_dropdown = QComboBox()
         self.stream_cmap_dropdown.addItems(COLORMAPS)
+        try:
+            self.stream_cmap_dropdown.setCurrentText('viridis_r')
+        except Exception:
+            pass
         self.map_dropdown = QComboBox()
-        self.map_dropdown.addItems(MAP_TYPES)
+        self.map_dropdown.setEnabled(False)
         self.field_dropdown = QComboBox()
         self.field_dropdown.setEnabled(False)
         self.vel_dropdown = QComboBox()
@@ -706,6 +812,28 @@ class PlotInteractiveWindow(QWidget):
 
         # --- Fixed colorbar state ---
         self.fixed_cbar_enabled = False  # <-- Add this line to initialize the attribute
+
+        # --- Fast playback drawing state ---
+        # These references are used to update an existing pcolormesh during
+        # snapshot playback without rebuilding the whole Matplotlib figure.
+        # They are only used when the plot geometry/options have not changed.
+        self._main_pcm = None
+        self._main_cbar = None
+        self._last_plot_signature = None
+        self._last_data_shape = None
+        self._fast_update_requested = False
+
+        # --- Display performance state ---
+        # The GUI should not send more cells to Matplotlib than the canvas can
+        # actually resolve. These defaults keep interactive plotting and
+        # playback usable for high-resolution outputs while preserving full
+        # resolution for analysis/export paths outside the GUI.
+        self.auto_downsample_enabled = True
+        self.max_display_points = 900
+        self.max_stream_points = 180
+        self.plot_cache_enabled = True
+        self.plot_cache_max_items = 12
+        self._plot_cache = OrderedDict()
 
         # --- Reflection overlay state ---
         self.reflect_enabled = False
@@ -816,12 +944,69 @@ class PlotInteractiveWindow(QWidget):
         except Exception:
             return []
 
-    def refresh_field_dropdown(self):
+    def selected_field_name(self):
+        if hasattr(self, 'map_dropdown') and self.map_dropdown.currentText().strip():
+            return self.map_dropdown.currentText().strip()
+        if hasattr(self, 'field_dropdown') and self.field_dropdown.currentText().strip():
+            return self.field_dropdown.currentText().strip()
         fields = self.available_field_names()
-        default = self.field_dropdown.currentText().strip() if hasattr(self, 'field_dropdown') else None
-        if default not in fields:
+        if 'gasdens' in fields:
+            return 'gasdens'
+        return fields[0] if fields else ''
+
+    def available_field_catalog(self, snapshot=None):
+        if not self.sim:
+            return {}
+        try:
+            snap = int(self.time_slider.value()) if snapshot is None and hasattr(self, 'time_slider') else int(snapshot or 0)
+            return dict(self.sim.available_fields(snapshot=snap))
+        except Exception:
+            return {}
+
+    def _pick_field_by_type(self, field_type, selected_field=None, snapshot=None):
+        catalog = self.available_field_catalog(snapshot=snapshot)
+        if selected_field and catalog.get(selected_field) == field_type:
+            return selected_field
+        matches = sorted(name for name, ftype in catalog.items() if ftype == field_type)
+        return matches[0] if matches else None
+
+    def refresh_field_dropdown(self, preferred=None):
+        fields = self.available_field_names()
+        default = preferred
+        current = self.field_dropdown.currentText().strip() if hasattr(self, 'field_dropdown') else None
+        if default is None:
+            default = current
+        if preferred and preferred in fields:
+            default = preferred
+        elif default not in fields:
             default = 'gasdens' if 'gasdens' in fields else (fields[0] if fields else None)
         populate_field_combo(self.field_dropdown, fields, default)
+        populate_field_combo(self.map_dropdown, fields, default)
+
+    def _resolve_streamline_vector_field(self, field_name, snapshot=None):
+        catalog = self.available_field_catalog(snapshot=snapshot)
+        if not field_name or not catalog:
+            return None
+        if catalog.get(field_name) == 'vector':
+            return field_name
+        candidates = []
+        if field_name.startswith('gasdens'):
+            candidates.extend(['gasv', 'gasdensv'])
+        if field_name.endswith('dens'):
+            candidates.append(f"{field_name[:-4]}v")
+        candidates.append(f"{field_name}v")
+        trimmed = re.sub(r"(dens|density|rho|energy)$", "", field_name)
+        if trimmed and trimmed != field_name:
+            candidates.append(f"{trimmed}v")
+        for candidate in candidates:
+            if catalog.get(candidate) == 'vector':
+                return candidate
+        prefixes = [field_name, re.sub(r"\d+$", "", field_name)]
+        for prefix in prefixes:
+            for name, ftype in catalog.items():
+                if ftype == 'vector' and name.startswith(prefix):
+                    return name
+        return None
 
     def _reflect_coordinates(self, axis, X, Y):
         if axis == "X-axis":
@@ -881,12 +1066,7 @@ class PlotInteractiveWindow(QWidget):
         self.setFont(QFont("Segoe UI", 13))
 
         logo_label = QLabel()
-        # Reduce logo size to occupy less vertical space
-        # Resolve logo path from several candidate locations so running the
-        # script from arbitrary CWD still finds the image when present in the
-        # repository or installed package data.
         logo_path = None
-        # 1) packaged resource (installed package)
         try:
             import pkg_resources
             candidate = pkg_resources.resource_filename('fargopy', 'data/fargopy_logo_white.png')
@@ -895,7 +1075,6 @@ class PlotInteractiveWindow(QWidget):
         except Exception:
             pass
 
-        # 2) gallery folder relative to the installed package location
         if logo_path is None:
             try:
                 pkg_dir = os.path.dirname(fp.__file__)
@@ -905,7 +1084,6 @@ class PlotInteractiveWindow(QWidget):
             except Exception:
                 pass
 
-        # 3) gallery folder relative to this script (covers running from repo)
         if logo_path is None:
             try:
                 script_dir = os.path.dirname(__file__)
@@ -915,7 +1093,6 @@ class PlotInteractiveWindow(QWidget):
             except Exception:
                 pass
 
-        # Load pixmap only if file exists; otherwise use text fallback
         logo_pixmap = QPixmap()
         try:
             if logo_path and os.path.exists(logo_path):
@@ -924,7 +1101,7 @@ class PlotInteractiveWindow(QWidget):
             logo_pixmap = QPixmap()
 
         if not logo_pixmap.isNull():
-            logo_pixmap = logo_pixmap.scaledToWidth(300, Qt.SmoothTransformation)
+            logo_pixmap = logo_pixmap.scaledToWidth(260, Qt.SmoothTransformation)
             logo_label.setPixmap(logo_pixmap)
         else:
             logo_label.setText("FARGOpy")
@@ -932,61 +1109,165 @@ class PlotInteractiveWindow(QWidget):
         logo_label.setAlignment(Qt.AlignCenter)
         logo_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
+        def orange_button_style(font_size=14, padding="7px 12px"):
+            return f"""
+                QPushButton {{
+                    background-color: #ff9800;
+                    color: white;
+                    font-size: {font_size}px;
+                    font-weight: bold;
+                    border-radius: 8px;
+                    padding: {padding};
+                }}
+                QPushButton:hover {{
+                    background-color: #e65100;
+                }}
+                QPushButton:disabled {{
+                    color: #d0d0d0;
+                    background-color: #6d6d6d;
+                }}
+            """
+
+        def make_group(title):
+            group = QGroupBox(title)
+            layout = QGridLayout(group)
+            layout.setHorizontalSpacing(10)
+            layout.setVerticalSpacing(7)
+            layout.setContentsMargins(10, 14, 10, 10)
+            return group, layout
+
         controls_group = QGroupBox("Visualization controls")
         controls_group.setFont(QFont("Segoe UI", 15, QFont.Bold))
-        controls_layout = QGridLayout()
-        controls_layout.setHorizontalSpacing(14)
-        controls_layout.setVerticalSpacing(10)
+        controls_vlayout = QVBoxLayout(controls_group)
+        controls_vlayout.setSpacing(10)
+        controls_vlayout.setContentsMargins(12, 14, 12, 12)
 
-        # --- Path selection for simulation (FIRST) ---
+        # --- Simulation ---
+        simulation_group, simulation_layout = make_group("Simulation")
         self.path_line = QLineEdit()
         self.path_line.setText("")
         self.path_line.setPlaceholderText("Select simulation path...")
         self.path_line.setReadOnly(True)
         self.browse_button = QPushButton("Browse...")
-        self.browse_button.setStyleSheet("""
-            QPushButton {
-                background-color: #ff9800;
-                color: white;
-                font-size: 13px;
-                font-weight: bold;
-                border-radius: 8px;
-                padding: 6px 12px;
-            }
-            QPushButton:hover {
-                background-color: #e65100;
-            }
-        """)
-        controls_layout.addWidget(QLabel("Simulation path:"), 0, 0)
-        controls_layout.addWidget(self.path_line, 0, 1)
-        controls_layout.addWidget(self.browse_button, 1, 1)
-
-        # --- Simulation Info/Units button ---
+        self.browse_button.setStyleSheet(orange_button_style(font_size=13, padding="6px 12px"))
         self.info_button = QPushButton("Simulation Info / Units")
-        self.info_button.setStyleSheet("""
-            QPushButton {
-                background-color: #ff9800;
-                color: white;
-                font-size: 14px;
-                font-weight: bold;
-                border-radius: 8px;
-                padding: 8px 16px;
-            }
-            QPushButton:hover {
-                background-color: #e65100;
-            }
-        """)
+        self.info_button.setStyleSheet(orange_button_style(font_size=13, padding="6px 12px"))
         self.info_button.setEnabled(False)
-        controls_layout.addWidget(self.info_button, 1, 0)
+        simulation_layout.addWidget(QLabel("Path:"), 0, 0)
+        simulation_layout.addWidget(self.path_line, 0, 1, 1, 2)
+        simulation_layout.addWidget(self.info_button, 1, 0, 1, 2)
+        simulation_layout.addWidget(self.browse_button, 1, 2)
 
-        # --- Snapshot (disabled until sim loaded) ---
+        # --- Snapshot ---
+        snapshot_group, snapshot_layout = make_group("Snapshot")
         self.time_slider = QSpinBox()
         self.time_slider.setEnabled(False)
-        controls_layout.addWidget(QLabel("Snapshot:"), 2, 0)
-        controls_layout.addWidget(self.time_slider, 2, 1)
+        self.update_button = QPushButton("Update plot")
+        self.update_button.setIcon(QIcon.fromTheme("view-refresh"))
+        self.update_button.setEnabled(False)
+        self.update_button.setStyleSheet(orange_button_style(font_size=15, padding="9px 18px"))
+        self.home_button = QPushButton("⌂")
+        self.home_button.setToolTip("Restore default view")
+        self.home_button.setEnabled(False)
+        self.home_button.setCursor(Qt.PointingHandCursor)
+        self.home_button.setFixedSize(36, 32)
+        self.home_button.setStyleSheet("""
+            QPushButton {
+                background-color: #455a64;
+                color: white;
+                font-size: 18px;
+                font-weight: bold;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #37474f;
+            }
+        """)
+        self.play_snap_button = QPushButton("▶")
+        self.play_snap_button.setToolTip("Play snapshots automatically from the current snapshot")
+        self.play_snap_button.setEnabled(False)
+        self.play_snap_button.setCursor(Qt.PointingHandCursor)
+        self.play_snap_button.setFixedSize(36, 32)
+        self.play_snap_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2e7d32;
+                color: white;
+                font-size: 16px;
+                font-weight: bold;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #1b5e20;
+            }
+            QPushButton:disabled {
+                background-color: #4a4a4a;
+                color: #9e9e9e;
+            }
+        """)
 
-        # --- Slices: compact and aligned (disabled until sim loaded) ---
-        slice_grid = QGridLayout()
+        self.pause_snap_button = QPushButton("⏸")
+        self.pause_snap_button.setToolTip("Pause snapshot playback at the current snapshot")
+        self.pause_snap_button.setEnabled(False)
+        self.pause_snap_button.setCursor(Qt.PointingHandCursor)
+        self.pause_snap_button.setFixedSize(36, 32)
+        self.pause_snap_button.setStyleSheet("""
+            QPushButton {
+                background-color: #c62828;
+                color: white;
+                font-size: 16px;
+                font-weight: bold;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #8e0000;
+            }
+            QPushButton:disabled {
+                background-color: #4a4a4a;
+                color: #9e9e9e;
+            }
+        """)
+
+        self.reset_snap_button = QPushButton("0")
+        self.reset_snap_button.setToolTip("Return to snapshot 0")
+        self.reset_snap_button.setEnabled(False)
+        self.reset_snap_button.setCursor(Qt.PointingHandCursor)
+        self.reset_snap_button.setFixedSize(36, 32)
+        self.reset_snap_button.setStyleSheet("""
+            QPushButton {
+                background-color: #1565c0;
+                color: white;
+                font-size: 16px;
+                font-weight: bold;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: #0d47a1;
+            }
+            QPushButton:disabled {
+                background-color: #4a4a4a;
+                color: #9e9e9e;
+            }
+        """)
+
+        self.snapshot_play_timer = QTimer(self)
+        self.snapshot_play_timer.setInterval(300)
+
+        playback_layout = QHBoxLayout()
+        playback_layout.setContentsMargins(0, 0, 0, 0)
+        playback_layout.setSpacing(6)
+        playback_layout.addWidget(self.play_snap_button)
+        playback_layout.addWidget(self.pause_snap_button)
+        playback_layout.addWidget(self.reset_snap_button)
+        playback_layout.addStretch()
+
+        snapshot_layout.addWidget(QLabel("Snapshot:"), 0, 0)
+        snapshot_layout.addWidget(self.time_slider, 0, 1, 1, 2)
+        snapshot_layout.addWidget(self.update_button, 1, 0, 1, 2)
+        snapshot_layout.addWidget(self.home_button, 1, 2, alignment=Qt.AlignRight)
+        snapshot_layout.addLayout(playback_layout, 2, 0, 1, 3)
+
+        # --- Slices ---
+        slices_group, slice_grid = make_group("Slices")
         slice_grid.setHorizontalSpacing(6)
         slice_grid.setVerticalSpacing(4)
         slice_grid.addWidget(QLabel(""), 0, 0, alignment=Qt.AlignCenter)
@@ -1008,11 +1289,9 @@ class PlotInteractiveWindow(QWidget):
             edit.setMaximumHeight(32)
             edit.setEnabled(False)
 
-        # Create dynamic labels for coordinate system
         self.r_label = QLabel("r:")
-        self.theta_label = QLabel("θ:")  # Will change to "z:" for cylindrical
+        self.theta_label = QLabel("θ:")
         self.phi_label = QLabel("φ:")
-        
         slice_grid.addWidget(self.r_label, 1, 0, alignment=Qt.AlignRight | Qt.AlignVCenter)
         slice_grid.addWidget(self.r_min, 1, 1)
         slice_grid.addWidget(self.r_max, 1, 2)
@@ -1023,76 +1302,100 @@ class PlotInteractiveWindow(QWidget):
         slice_grid.addWidget(self.phi_min, 3, 1)
         slice_grid.addWidget(self.phi_max, 3, 2)
 
-        # --- Slice type selector inside the slice box ---
         self.slice_type_combo = QComboBox()
-        self.slice_type_combo.addItems(['theta', 'phi'])  # Will be updated based on coordinate system
+        self.slice_type_combo.addItems(['theta', 'phi'])
         self.slice_type_combo.setCurrentText('theta')
         self.slice_type_combo.currentTextChanged.connect(self.on_slice_type_change)
         self.slice_type_label = QLabel("Slice type:")
         slice_grid.addWidget(self.slice_type_label, 4, 0)
         slice_grid.addWidget(self.slice_type_combo, 4, 1, 1, 2)
 
-        slice_box = QGroupBox("Slices")
-        slice_box.setLayout(slice_grid)
-        slice_box.setStyleSheet("""
-            QGroupBox {
-                font-weight: normal;
-                border: 1px solid #bdbdbd;
-                border-radius: 6px;
-                margin-top: 4px;
-                padding: 2px 2px 2px 2px;
-                color: #f5f5f5;
-                background: #23272b;
-            }
-        """)
-        slice_box.setSizePolicy(slice_box.sizePolicy().horizontalPolicy(), QSizePolicy.Fixed)
-        controls_layout.addWidget(slice_box, 3, 0, 1, 2, alignment=Qt.AlignLeft | Qt.AlignTop)
-
-        # --- Other controls (disabled until sim loaded) ---
+        # --- Rendering ---
+        rendering_group, rendering_layout = make_group("Rendering")
         self.res_slider = QSpinBox()
         self.res_slider.setMinimum(50)
-        self.res_slider.setMaximum(1000)
+        self.res_slider.setMaximum(2147483647)
         self.res_slider.setSingleStep(10)
         self.res_slider.setValue(500)
         self.res_slider.setEnabled(False)
-        controls_layout.addWidget(QLabel("Resolution:"), 4, 0)
-        controls_layout.addWidget(self.res_slider, 4, 1)
-
         self.interp_toggle = QCheckBox("Interpolate")
         self.interp_toggle.setEnabled(False)
-        controls_layout.addWidget(self.interp_toggle, 5, 0)
+        self.length_scale_combo = QComboBox()
+        self.length_scale_combo.addItems([
+            "Simulation UL", "cm (CGS)", "m (MKS)", "AU", "Earth radii", "Jupiter radii", "Solar radii"
+        ])
+        self.length_scale_combo.setCurrentText("Simulation UL")
+        self.plot_options_button = QPushButton("Graph Options")
+        self.plot_options_button.setStyleSheet(orange_button_style(font_size=14, padding="8px 16px"))
+        rendering_layout.addWidget(QLabel("Resolution:"), 0, 0)
+        rendering_layout.addWidget(self.res_slider, 0, 1)
+        rendering_layout.addWidget(self.interp_toggle, 1, 0, 1, 2)
+        rendering_layout.addWidget(QLabel("Length axis in:"), 2, 0)
+        rendering_layout.addWidget(self.length_scale_combo, 2, 1)
+        rendering_layout.addWidget(self.plot_options_button, 3, 0, 1, 2)
 
+        # --- Performance / Level of Detail ---
+        performance_group, performance_layout = make_group("Performance")
+        self.auto_downsample_toggle = QCheckBox("Auto downsample display")
+        self.auto_downsample_toggle.setChecked(True)
+        self.auto_downsample_toggle.setToolTip("Limit the displayed grid resolution so high-resolution simulations remain interactive.")
+
+        self.max_display_res_spin = QSpinBox()
+        self.max_display_res_spin.setMinimum(100)
+        self.max_display_res_spin.setMaximum(10000)
+        self.max_display_res_spin.setSingleStep(100)
+        self.max_display_res_spin.setValue(900)
+        self.max_display_res_spin.setToolTip("Maximum number of plotted cells per axis in the interactive display.")
+
+        self.stream_display_res_spin = QSpinBox()
+        self.stream_display_res_spin.setMinimum(50)
+        self.stream_display_res_spin.setMaximum(2000)
+        self.stream_display_res_spin.setSingleStep(25)
+        self.stream_display_res_spin.setValue(180)
+        self.stream_display_res_spin.setToolTip("Maximum grid resolution per axis used to compute streamlines.")
+
+        self.plot_cache_toggle = QCheckBox("Cache display frames")
+        self.plot_cache_toggle.setChecked(True)
+        self.plot_cache_toggle.setToolTip("Keep a small cache of rendered display arrays for smoother back-and-forth navigation.")
+
+        self.plot_cache_size_spin = QSpinBox()
+        self.plot_cache_size_spin.setMinimum(1)
+        self.plot_cache_size_spin.setMaximum(200)
+        self.plot_cache_size_spin.setSingleStep(1)
+        self.plot_cache_size_spin.setValue(12)
+
+        performance_layout.addWidget(self.auto_downsample_toggle, 0, 0, 1, 2)
+        performance_layout.addWidget(QLabel("Max display res:"), 1, 0)
+        performance_layout.addWidget(self.max_display_res_spin, 1, 1)
+        performance_layout.addWidget(QLabel("Streamline grid:"), 2, 0)
+        performance_layout.addWidget(self.stream_display_res_spin, 2, 1)
+        performance_layout.addWidget(self.plot_cache_toggle, 3, 0, 1, 2)
+        performance_layout.addWidget(QLabel("Cache frames:"), 4, 0)
+        performance_layout.addWidget(self.plot_cache_size_spin, 4, 1)
+
+        # --- Streamlines ---
+        stream_group, stream_layout = make_group("Streamlines")
         self.streamlines_toggle = QCheckBox("Streamlines")
         self.streamlines_toggle.setEnabled(False)
-        controls_layout.addWidget(self.streamlines_toggle, 5, 1)
-
         self.density_slider = QDoubleSpinBox()
         self.density_slider.setMinimum(1)
         self.density_slider.setMaximum(10)
         self.density_slider.setSingleStep(0.5)
         self.density_slider.setValue(3)
         self.density_slider.setEnabled(False)
-        controls_layout.addWidget(QLabel("Streamline density:"), 6, 0)
-        controls_layout.addWidget(self.density_slider, 6, 1)
+        stream_layout.addWidget(self.streamlines_toggle, 0, 0, 1, 2)
+        stream_layout.addWidget(QLabel("Density:"), 1, 0)
+        stream_layout.addWidget(self.density_slider, 1, 1)
 
-        self.hill_frac_slider = QDoubleSpinBox()
-        self.hill_frac_slider.setMinimum(0.1)
-        self.hill_frac_slider.setMaximum(2.0)
-        self.hill_frac_slider.setSingleStep(0.05)
-        self.hill_frac_slider.setValue(1.0)
-        self.hill_frac_slider.setEnabled(False)
-        controls_layout.addWidget(QLabel("Hill fraction:"), 7, 0)
-        controls_layout.addWidget(self.hill_frac_slider, 7, 1)
-
+        # --- Planet / Hill radius ---
+        hill_group, hill_layout = make_group("Planet / Hill radius")
         self.show_circle_toggle = QCheckBox("Show Hill")
-        controls_layout.addWidget(self.show_circle_toggle, 8, 0)
-
+        self.show_circle_toggle.setEnabled(False)
         self.reflect_button = QPushButton("Reflect")
         self.reflect_button.setEnabled(False)
         self.reflect_button.setCursor(Qt.PointingHandCursor)
         self.reflect_button.setFixedHeight(32)
-        self.reflect_button.setStyleSheet(
-            """
+        self.reflect_button.setStyleSheet("""
             QPushButton {
                 background-color: #3949ab;
                 color: white;
@@ -1103,73 +1406,56 @@ class PlotInteractiveWindow(QWidget):
             QPushButton:hover {
                 background-color: #283593;
             }
-            """
-        )
-        controls_layout.addWidget(self.reflect_button, 8, 1, alignment=Qt.AlignRight)
+            QPushButton:disabled {
+                background-color: #555555;
+                color: #d0d0d0;
+            }
+        """)
+        self.hill_planet_combo = QComboBox()
+        self.hill_planet_combo.setEnabled(False)
+        self.hill_frac_slider = QDoubleSpinBox()
+        self.hill_frac_slider.setMinimum(0.1)
+        self.hill_frac_slider.setMaximum(1e9)
+        self.hill_frac_slider.setDecimals(4)
+        self.hill_frac_slider.setSingleStep(0.05)
+        self.hill_frac_slider.setValue(1.0)
+        self.hill_frac_slider.setEnabled(False)
+        hill_layout.addWidget(self.show_circle_toggle, 0, 0)
+        hill_layout.addWidget(self.reflect_button, 0, 1, alignment=Qt.AlignRight)
+        hill_layout.addWidget(QLabel("Hill planet:"), 1, 0)
+        hill_layout.addWidget(self.hill_planet_combo, 1, 1)
+        hill_layout.addWidget(QLabel("Hill fraction:"), 2, 0)
+        hill_layout.addWidget(self.hill_frac_slider, 2, 1)
 
-        # --- Update plot button ---
-        self.update_button = QPushButton("Update plot")
-        self.update_button.setIcon(QIcon.fromTheme("view-refresh"))
-        self.update_button.setEnabled(False)
-        controls_layout.addWidget(self.update_button, 13, 0, 1, 2)
+        # --- Export ---
+        export_group, export_layout = make_group("Export")
+        self.video_button = QPushButton("Create video")
+        self.video_button.setStyleSheet(orange_button_style(font_size=15, padding="8px 16px"))
+        export_layout.addWidget(self.video_button, 0, 0, 1, 2)
+        self.video_button.clicked.connect(self.open_video_options_dialog)
 
-        # --- Status label ---
         self.status_label = QLabel("")
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setFont(QFont("Segoe UI", 12, QFont.Bold))
-        controls_layout.addWidget(self.status_label, 14, 0, 1, 2)
 
-        # --- Length scale selector for axes (always allow all units) ---
-        self.length_scale_combo = QComboBox()
-        self.length_scale_combo.addItems([
-            "Simulation UL", "cm (CGS)", "m (MKS)", "AU", "Earth radii", "Jupiter radii", "Solar radii"
-        ])
-        self.length_scale_combo.setCurrentText("Simulation UL")
-        controls_layout.addWidget(QLabel("Length axis in:"), 15, 0)
-        controls_layout.addWidget(self.length_scale_combo, 15, 1)
-        self.length_scale_combo.currentTextChanged.connect(lambda _: self.plot_density())
+        controls_vlayout.addWidget(simulation_group)
+        controls_vlayout.addWidget(snapshot_group)
+        controls_vlayout.addWidget(slices_group)
+        controls_vlayout.addWidget(rendering_group)
+        controls_vlayout.addWidget(performance_group)
+        controls_vlayout.addWidget(stream_group)
+        controls_vlayout.addWidget(hill_group)
+        controls_vlayout.addWidget(export_group)
+        controls_vlayout.addWidget(self.status_label)
+        controls_vlayout.addStretch()
 
-        # --- Graph options button ---
-        self.plot_options_button = QPushButton("Graph Options")
-        self.plot_options_button.setStyleSheet("""
-            QPushButton {
-                background-color: #ff9800;
-                color: white;
-                font-size: 14px;
-                font-weight: bold;
-                border-radius: 8px;
-                padding: 8px 16px;
-            }
-            QPushButton:hover {
-                background-color: #e65100;
-            }
-        """)
-        controls_layout.addWidget(self.plot_options_button, 20, 0, 1, 2)
-
-        # --- Button to create video ---
-        self.video_button = QPushButton("Create video")
-        controls_layout.addWidget(self.video_button, 21, 0, 1, 2)
-        self.video_button.clicked.connect(self.open_video_options_dialog)
-
-        # --- Controls reserved for dialog (excluded from main panel) ---
-        # Do not create or add these widgets to the main panel:
-        # self.cmap_dropdown
-        # self.stream_cmap_dropdown
-        # self.map_dropdown
-        # self.vel_dropdown
-        # self.fixed_cbar_checkbox
-        # self.fixed_cbar_snap_spin
-        # self.density_min_thresh_spin
-        # self.density_max_thresh_spin
-
-        controls_group.setLayout(controls_layout)
         controls_group.setStyleSheet("""
             QGroupBox {
                 font-weight: bold;
                 border: 1.5px solid #1976D2;
                 border-radius: 8px;
                 margin-top: 8px;
-                padding: 16px;
+                padding: 8px;
                 color: #f5f5f5;
             }
             QGroupBox:title {
@@ -1179,20 +1465,7 @@ class PlotInteractiveWindow(QWidget):
             }
         """)
 
-        self.update_button.setStyleSheet("""
-            QPushButton {
-                background-color: #ff9800;
-                color: white;
-                font-size: 15px;
-                font-weight: bold;
-                border-radius: 8px;
-                padding: 10px 20px;
-            }
-            QPushButton:hover {
-                background-color: #e65100;
-            }
-        """)
-        for widget in [self.time_slider, self.res_slider, self.density_slider, self.hill_frac_slider]:
+        for widget in [self.time_slider, self.res_slider, self.density_slider, self.hill_frac_slider, self.max_display_res_spin, self.stream_display_res_spin, self.plot_cache_size_spin]:
             widget.setStyleSheet("""
                 QSpinBox, QDoubleSpinBox {
                     background: #2c3136;
@@ -1207,13 +1480,13 @@ class PlotInteractiveWindow(QWidget):
         left_panel_widget = QWidget()
         left_panel_layout = QVBoxLayout(left_panel_widget)
         left_panel_layout.setSpacing(8)
-        left_panel_layout.setContentsMargins(24, 12, 24, 12)
+        left_panel_layout.setContentsMargins(18, 10, 18, 10)
         left_panel_layout.addWidget(logo_label, alignment=Qt.AlignHCenter)
-        left_panel_layout.addWidget(controls_group, stretch=1)
+        left_panel_layout.addWidget(controls_group)
 
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(180)
+        self.log_text.setMaximumHeight(150)
         self.log_text.setPlaceholderText("Interface log")
         self.log_text.setStyleSheet("""
             QTextEdit {
@@ -1226,8 +1499,8 @@ class PlotInteractiveWindow(QWidget):
         left_panel_layout.addWidget(QLabel("Log"))
         left_panel_layout.addWidget(self.log_text)
 
-        left_panel_widget.setMinimumWidth(420)
-        left_panel_widget.setMaximumWidth(520)
+        left_panel_widget.setMinimumWidth(430)
+        left_panel_widget.setMaximumWidth(560)
         left_panel_widget.setStyleSheet("""
             QWidget {
                 background-color: #23272b;
@@ -1237,8 +1510,28 @@ class PlotInteractiveWindow(QWidget):
                 background: #23272b;
                 font-size: 15px;
             }
+            QCheckBox::indicator {
+                width: 14px;
+                height: 14px;
+                background-color: #2c3136;
+                border: 1px solid #888;
+                border-radius: 3px;
+            }
+            QCheckBox::indicator:checked {
+                background-color: #43a047;
+                border: 1px solid #66bb6a;
+            }
+            QCheckBox::indicator:unchecked {
+                background-color: #2c3136;
+                border: 1px solid #888;
+            }
+            QCheckBox::indicator:disabled {
+                background-color: #3a3a3a;
+                border: 1px solid #555;
+            }
             QGroupBox {
                 color: #f5f5f5;
+                background-color: #23272b;
             }
             QLineEdit, QSpinBox, QDoubleSpinBox {
                 background: #2c3136;
@@ -1271,6 +1564,28 @@ class PlotInteractiveWindow(QWidget):
             }
         """)
 
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(left_panel_widget)
+        scroll_area.setMinimumWidth(460)
+        scroll_area.setMaximumWidth(590)
+        scroll_area.setStyleSheet("""
+            QScrollArea {
+                background-color: #23272b;
+                border: none;
+            }
+            QScrollBar:vertical {
+                background: #23272b;
+                width: 12px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background: #555;
+                min-height: 20px;
+                border-radius: 6px;
+            }
+        """)
+
         self.figure = Figure(figsize=(7, 5))
         self.canvas = FigureCanvas(self.figure)
         self.toolbar = NavigationToolbar(self.canvas, self)
@@ -1282,7 +1597,7 @@ class PlotInteractiveWindow(QWidget):
         right_panel.addWidget(self.canvas)
 
         h_layout = QHBoxLayout()
-        h_layout.addWidget(left_panel_widget, 0)
+        h_layout.addWidget(scroll_area, 0)
         line = QFrame()
         line.setFrameShape(QFrame.VLine)
         line.setFrameShadow(QFrame.Sunken)
@@ -1293,6 +1608,11 @@ class PlotInteractiveWindow(QWidget):
 
         # Connect signals
         self.update_button.clicked.connect(self.update_plot)
+        self.home_button.clicked.connect(self.reset_default_view)
+        self.play_snap_button.clicked.connect(self.start_snapshot_playback)
+        self.pause_snap_button.clicked.connect(self.pause_snapshot_playback)
+        self.reset_snap_button.clicked.connect(self.go_to_snapshot_zero)
+        self.snapshot_play_timer.timeout.connect(self.advance_snapshot_playback)
         self.browse_button.clicked.connect(self.select_simulation_path)
         self.info_button.clicked.connect(self.show_sim_info)
         for edit in [self.r_min, self.r_max, self.theta_min, self.theta_max, self.phi_min, self.phi_max]:
@@ -1300,6 +1620,13 @@ class PlotInteractiveWindow(QWidget):
             edit.editingFinished.connect(self.on_slice_change)
         self.plot_options_button.clicked.connect(self.show_plot_options_dialog)
         self.reflect_button.clicked.connect(self.open_reflect_dialog)
+        self.length_scale_combo.currentTextChanged.connect(lambda _: self.plot_density())
+        self.auto_downsample_toggle.stateChanged.connect(lambda _: self._on_performance_options_changed())
+        self.max_display_res_spin.valueChanged.connect(lambda _: self._on_performance_options_changed())
+        self.stream_display_res_spin.valueChanged.connect(lambda _: self._on_performance_options_changed())
+        self.plot_cache_toggle.stateChanged.connect(lambda _: self._on_cache_options_changed())
+        self.plot_cache_size_spin.valueChanged.connect(lambda _: self._on_cache_options_changed())
+        self.hill_planet_combo.currentIndexChanged.connect(lambda _: self.plot_density())
         self.canvas.mpl_connect('button_release_event', self.on_zoom_release)
 
     def normalize_decimal(self, lineedit):
@@ -1367,12 +1694,43 @@ class PlotInteractiveWindow(QWidget):
             self._safe_call("Loading simulation", self.load_simulation, path)
 
     def load_simulation(self, path):
+        self._loading_simulation = True
         self.sim = fp.Simulation(output_dir=path)
         # self.sim.units('CGS')  # <-- Remove this line, respeta las unidades originales
-        
-        # Detect coordinate system
-        self.coord_system = getattr(self.sim.vars, 'COORDINATES', 'spherical').lower()
+
+        # Detect coordinate system — be defensive if simulation properties
+        coord = 'spherical'
+        try:
+            if hasattr(self.sim, 'vars') and self.sim.vars is not None:
+                coord = getattr(self.sim.vars, 'COORDINATES', coord)
+            else:
+                # Try explicitly loading properties if available
+                if hasattr(self.sim, 'load_properties'):
+                    try:
+                        self.sim.load_properties()
+                        if hasattr(self.sim, 'vars') and self.sim.vars is not None:
+                            coord = getattr(self.sim.vars, 'COORDINATES', coord)
+                    except Exception:
+                        pass
+        except Exception:
+            coord = 'spherical'
+
+        self.coord_system = str(coord).lower()
         is_polar_2d = self._is_polar_2d()
+
+        # If properties weren't loaded correctly, bail out and keep UI disabled
+        if not hasattr(self.sim, 'vars') or getattr(self.sim, 'vars', None) is None or not hasattr(self.sim, 'domains') or getattr(self.sim, 'domains', None) is None:
+            try:
+                self._append_log('Simulation variables or domains not found; UI controls disabled.', level='error')
+            except Exception:
+                print('Simulation variables or domains not found; UI controls disabled.')
+            for w in [getattr(self, 'time_slider', None), getattr(self, 'res_slider', None), getattr(self, 'interp_toggle', None), getattr(self, 'streamlines_toggle', None), getattr(self, 'update_button', None), getattr(self, 'play_snap_button', None), getattr(self, 'pause_snap_button', None), getattr(self, 'reset_snap_button', None), getattr(self, 'hill_planet_combo', None), getattr(self, 'field_dropdown', None), getattr(self, 'map_dropdown', None)]:
+                try:
+                    if w is not None:
+                        w.setEnabled(False)
+                except Exception:
+                    pass
+            return
 
         # Update UI based on coordinate system
         self._configure_coordinate_controls()
@@ -1385,8 +1743,15 @@ class PlotInteractiveWindow(QWidget):
         
         self.time_slider.setEnabled(True)
         self.time_slider.setMinimum(0)
-        self.time_slider.setMaximum(self.sim._get_nsnaps()-1)
-        self.time_slider.setValue(1)
+        try:
+            nsnaps = int(self.sim._get_nsnaps())
+            self.time_slider.setMaximum(max(nsnaps - 1, 0))
+            # Ensure slider has a valid value
+            self.time_slider.setValue(min(1, max(nsnaps - 1, 0)))
+        except Exception:
+            # Simulation not fully populated; set defaults and keep UI usable
+            self.time_slider.setMaximum(0)
+            self.time_slider.setValue(0)
         self.r_min.setText("")
         self.r_max.setText("")
         
@@ -1402,17 +1767,22 @@ class PlotInteractiveWindow(QWidget):
                 self.theta_min.setText(z_val)
             except Exception:
                 self.theta_min.setText("0.0")
+            self.last_slice_str = f"z={self.theta_min.text()}"
         else:  # spherical
             theta_domain = getattr(self.sim.domains, 'theta', None)
             if theta_domain is not None:
-                self.theta_min.setText(self._format_angle(theta_domain.max()))
+                theta_val = self._format_angle(theta_domain.max())
+                self.theta_min.setText(theta_val)
+                self.last_slice_str = f"theta={theta_val}"
             else:
                 self.theta_min.setText("")
+                self.last_slice_str = ""
         
         self.theta_max.setText('')
         self.phi_min.setText("")
         self.phi_max.setText("")
-        self.last_slice_str = ""
+        if self.coord_system != 'spherical' or is_polar_2d:
+            self.last_slice_str = ""
         for edit in [self.r_min, self.r_max, self.theta_min, self.theta_max, self.phi_min, self.phi_max]:
             edit.setEnabled(True)
         if self._is_polar_2d():
@@ -1425,26 +1795,429 @@ class PlotInteractiveWindow(QWidget):
         self.density_slider.setEnabled(True)
         self.hill_frac_slider.setEnabled(True)
         self.show_circle_toggle.setEnabled(True)
+        try:
+            self.hill_planet_combo.clear()
+            planets = self.sim.load_planets(snapshot=self.time_slider.value())
+            for i, planet in enumerate(planets):
+                name = getattr(planet, "name", f"Planet {i + 1}")
+                self.hill_planet_combo.addItem(f"{i}: {name}", i)
+            self.hill_planet_combo.setEnabled(len(planets) > 0)
+        except Exception:
+            self.hill_planet_combo.clear()
+            self.hill_planet_combo.setEnabled(False)
         self.reflect_button.setEnabled(True)
         self.update_button.setEnabled(True)
+        self.home_button.setEnabled(True)
+        self.play_snap_button.setEnabled(True)
+        self.pause_snap_button.setEnabled(True)
+        self.reset_snap_button.setEnabled(True)
         self.info_button.setEnabled(True)
         # Update snapshot limits in the dialog
         self.fixed_cbar_snap_spin.setMaximum(self.sim._get_nsnaps()-1)
         self.fixed_cbar_snap_spin.setValue(1)
-        self.fixed_cbar_limits = {
-            'Density': None,
-            'Velocity': None,
-            'Energy': None
-        }
-        self.refresh_field_dropdown()
+        self.fixed_cbar_limits = {}
+        self.refresh_field_dropdown(preferred='gasdens')
         self.field_dropdown.setEnabled(True)
+        self.map_dropdown.setEnabled(True)
         # Ensure default colormap is applied when a simulation is loaded
         try:
             self.cmap_dropdown.setCurrentText('inferno')
+            self.stream_cmap_dropdown.setCurrentText('viridis_r')
         except Exception:
             pass
         self._append_log(f"Loaded simulation in {self.coord_system} mode")
+        self._loading_simulation = False
         self.plot_density()
+
+    def _restore_default_view_state(self):
+        if not self.sim:
+            return
+
+        self._configure_coordinate_controls()
+        if self._is_polar_2d():
+            self.slice_type = 'phi'
+            if hasattr(self, 'slice_type_combo'):
+                self.slice_type_combo.blockSignals(True)
+                self.slice_type_combo.setCurrentText('phi')
+                self.slice_type_combo.blockSignals(False)
+            self.r_min.setText("")
+            self.r_max.setText("")
+            self.theta_min.setText("")
+            self.theta_max.setText("")
+            self.phi_min.setText("")
+            self.phi_max.setText("")
+            self.theta_min.setEnabled(False)
+            self.theta_max.setEnabled(False)
+            self.slice_type_combo.setEnabled(False)
+        elif self.coord_system == 'cylindrical':
+            self.slice_type = 'z'
+            if hasattr(self, 'slice_type_combo'):
+                self.slice_type_combo.blockSignals(True)
+                self.slice_type_combo.setCurrentText('z')
+                self.slice_type_combo.blockSignals(False)
+            self.r_min.setText("")
+            self.r_max.setText("")
+            self.theta_min.setText(self._format_angle(0.0))
+            self.theta_max.setText("")
+            self.phi_min.setText("")
+            self.phi_max.setText("")
+            self.theta_min.setEnabled(True)
+            self.theta_max.setEnabled(True)
+            self.slice_type_combo.setEnabled(True)
+        else:
+            self.slice_type = 'theta'
+            if hasattr(self, 'slice_type_combo'):
+                self.slice_type_combo.blockSignals(True)
+                self.slice_type_combo.setCurrentText('theta')
+                self.slice_type_combo.blockSignals(False)
+            self.r_min.setText("")
+            self.r_max.setText("")
+            theta_domain = getattr(self.sim.domains, 'theta', None)
+            if theta_domain is not None:
+                self.theta_min.setText(self._format_angle(theta_domain.max()))
+            else:
+                self.theta_min.setText("")
+            self.theta_max.setText("")
+            self.phi_min.setText("")
+            self.phi_max.setText("")
+            self.theta_min.setEnabled(True)
+            self.theta_max.setEnabled(True)
+            self.slice_type_combo.setEnabled(True)
+
+        self.last_slice_str = ""
+        self._fields_edited = False
+
+    def start_snapshot_playback(self):
+        if not self.sim:
+            return
+        if self.time_slider.value() >= self.time_slider.maximum():
+            self.time_slider.setValue(self.time_slider.minimum())
+        self.snapshot_play_timer.start()
+
+    def pause_snapshot_playback(self):
+        if hasattr(self, 'snapshot_play_timer'):
+            self.snapshot_play_timer.stop()
+
+    def go_to_snapshot_zero(self):
+        if not self.sim:
+            return
+        self.pause_snapshot_playback()
+        self.time_slider.setValue(0)
+        self.update_plot()
+
+    def advance_snapshot_playback(self):
+        if not self.sim:
+            self.pause_snapshot_playback()
+            return
+
+        current = self.time_slider.value()
+        last = self.time_slider.maximum()
+
+        if current >= last:
+            self.pause_snapshot_playback()
+            return
+
+        self.time_slider.setValue(current + 1)
+        self.update_plot_fast()
+
+    def update_plot_fast(self):
+        """Playback-oriented update.
+
+        The normal plotting path is still used to compute the new field for
+        the current snapshot. If the plot state is compatible with the
+        previous frame, _plot_density_impl updates the existing QuadMesh via
+        set_array(). Otherwise it falls back to the full plot rebuild.
+        """
+        if self.render_cached_current_frame():
+            return
+        self._fast_update_requested = True
+        try:
+            self.plot_density()
+        finally:
+            self._fast_update_requested = False
+
+    def plot_state_signature(self, slice_str=None):
+        """Return a snapshot-independent signature of the current plot state.
+
+        If this signature changes, the current Matplotlib artists may no
+        longer be compatible with a fast set_array update and the full plot
+        must be rebuilt.
+        """
+        try:
+            selected_field = self.selected_field_name()
+        except Exception:
+            selected_field = ""
+        if slice_str is None:
+            try:
+                slice_str = self.build_slice_str()
+            except Exception:
+                slice_str = ""
+        return (
+            selected_field,
+            self.vel_dropdown.currentText() if hasattr(self, 'vel_dropdown') else '',
+            str(slice_str or ''),
+            int(self.res_slider.value()) if hasattr(self, 'res_slider') else None,
+            bool(self.interp_toggle.isChecked()) if hasattr(self, 'interp_toggle') else False,
+            self.cmap_dropdown.currentText() if hasattr(self, 'cmap_dropdown') else '',
+            bool(self.fixed_cbar_enabled),
+            int(self.fixed_cbar_snap_spin.value()) if hasattr(self, 'fixed_cbar_snap_spin') else None,
+            bool(self.manual_vmin_vmax_enabled),
+            float(self.manual_vmin),
+            float(self.manual_vmax),
+            self.length_scale_combo.currentText() if hasattr(self, 'length_scale_combo') else '',
+            bool(self.auto_downsample_toggle.isChecked()) if hasattr(self, 'auto_downsample_toggle') else True,
+            int(self.max_display_res_spin.value()) if hasattr(self, 'max_display_res_spin') else self.max_display_points,
+            int(self.stream_display_res_spin.value()) if hasattr(self, 'stream_display_res_spin') else self.max_stream_points,
+        )
+
+    def can_use_fast_pcolormesh_update(self, signature, data_map):
+        """Return True when playback can update only the existing QuadMesh.
+
+        Streamlines, reflection overlays and Hill-radius artists are excluded
+        from the fast path because they depend on vector fields or planet
+        positions and should be regenerated snapshot by snapshot.
+        """
+        if not getattr(self, '_fast_update_requested', False):
+            return False
+        if getattr(self, '_main_pcm', None) is None:
+            return False
+        if getattr(self, '_last_plot_signature', None) != signature:
+            return False
+        if getattr(self, '_last_data_shape', None) != tuple(np.asarray(data_map).shape):
+            return False
+        if self.streamlines_toggle.isChecked():
+            return False
+        if getattr(self, 'reflect_enabled', False):
+            return False
+        if self.show_circle_toggle.isChecked():
+            return False
+        return True
+
+    def _on_performance_options_changed(self):
+        """Apply performance-control changes and redraw with the new LOD policy."""
+        try:
+            self.auto_downsample_enabled = bool(self.auto_downsample_toggle.isChecked())
+            self.max_display_points = int(self.max_display_res_spin.value())
+            self.max_stream_points = int(self.stream_display_res_spin.value())
+            self.clear_plot_cache()
+            if self.sim is not None:
+                self.plot_density()
+        except Exception as exc:
+            self._handle_exception("Performance options", exc)
+
+    def _on_cache_options_changed(self):
+        try:
+            self.plot_cache_enabled = bool(self.plot_cache_toggle.isChecked())
+            self.plot_cache_max_items = int(self.plot_cache_size_spin.value())
+            if not self.plot_cache_enabled:
+                self.clear_plot_cache()
+            else:
+                self._trim_plot_cache()
+        except Exception as exc:
+            self._handle_exception("Cache options", exc)
+
+    def clear_plot_cache(self):
+        try:
+            self._plot_cache.clear()
+        except Exception:
+            self._plot_cache = OrderedDict()
+
+    def _simple_plot_cache_allowed(self):
+        try:
+            if hasattr(self, 'plot_cache_toggle') and not self.plot_cache_toggle.isChecked():
+                return False
+            if hasattr(self, 'streamlines_toggle') and self.streamlines_toggle.isChecked():
+                return False
+            if hasattr(self, 'show_circle_toggle') and self.show_circle_toggle.isChecked():
+                return False
+            if getattr(self, 'reflect_enabled', False):
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _plot_cache_key(self, signature=None, snapshot=None):
+        try:
+            if signature is None:
+                signature = self.plot_state_signature()
+            if snapshot is None:
+                snapshot = int(self.time_slider.value())
+            return (int(snapshot), signature)
+        except Exception:
+            return None
+
+    def _put_plot_cache(self, key, entry):
+        if key is None or not self._simple_plot_cache_allowed():
+            return
+        try:
+            self._plot_cache[key] = entry
+            self._plot_cache.move_to_end(key)
+            self._trim_plot_cache()
+        except Exception:
+            pass
+
+    def render_cached_current_frame(self):
+        """Render a cached simple pcolormesh frame, if available.
+
+        The cache is intentionally restricted to plots without streamlines,
+        Hill-radius overlays or reflection overlays. Those artists have their
+        own state and should be regenerated by the complete plotting path.
+        """
+        if not self._simple_plot_cache_allowed():
+            return False
+        key = self._plot_cache_key()
+        if key is None:
+            return False
+        entry = self._plot_cache.get(key)
+        if entry is None:
+            return False
+        try:
+            self._plot_cache.move_to_end(key)
+            X_plot = entry['X']
+            Y_plot = entry['Y']
+            data_map = entry['Z']
+            cmap = entry['cmap']
+            vmin = entry.get('vmin')
+            vmax = entry.get('vmax')
+            xlabel = entry.get('xlabel', 'X')
+            ylabel = entry.get('ylabel', 'Y')
+            cbar_label = entry.get('cbar_label', '')
+            signature = entry.get('signature')
+
+            self.figure.clear()
+            ax = self.figure.add_subplot(111)
+            ax.set_facecolor('white')
+            self.figure.set_facecolor('white')
+            pcm = ax.pcolormesh(X_plot, Y_plot, data_map, shading='auto', cmap=cmap, vmin=vmin, vmax=vmax)
+            ax.set_xlabel(xlabel, fontsize=15, fontname='Serif')
+            ax.set_ylabel(ylabel, fontsize=15, fontname='Serif')
+            try:
+                fp.Plot.fargopy_mark(ax)
+            except Exception:
+                pass
+            try:
+                cbar = self.figure.colorbar(pcm, ax=ax)
+                cbar.set_label(cbar_label, fontsize=15, fontname='Serif')
+            except Exception:
+                cbar = None
+            self._main_pcm = pcm
+            self._main_cbar = cbar
+            self._last_plot_signature = signature
+            self._last_data_shape = tuple(np.asarray(data_map).shape)
+            self.canvas.draw_idle()
+            QTimer.singleShot(200, lambda: self.status_label.setText(""))
+            return True
+        except Exception as exc:
+            try:
+                self._append_log(f"Cached frame render failed; rebuilding: {exc}", level='warning')
+            except Exception:
+                pass
+            return False
+
+    def _trim_plot_cache(self):
+        try:
+            max_items = max(1, int(self.plot_cache_size_spin.value())) if hasattr(self, 'plot_cache_size_spin') else self.plot_cache_max_items
+            while len(self._plot_cache) > max_items:
+                self._plot_cache.popitem(last=False)
+        except Exception:
+            pass
+
+    def effective_display_resolution(self, requested_res):
+        """Clamp interpolation resolution in interactive mode.
+
+        This prevents an accidental very large interpolation grid from making
+        the GUI unusable. The user can disable Auto downsample for full native
+        display, but the default path remains interactive.
+        """
+        try:
+            requested_res = int(requested_res)
+            if hasattr(self, 'auto_downsample_toggle'):
+                self.auto_downsample_enabled = bool(self.auto_downsample_toggle.isChecked())
+            if hasattr(self, 'max_display_res_spin'):
+                self.max_display_points = int(self.max_display_res_spin.value())
+            if self.auto_downsample_enabled:
+                return max(2, min(requested_res, int(self.max_display_points)))
+            return requested_res
+        except Exception:
+            return requested_res
+
+    def _array_stride(self, shape, max_points):
+        try:
+            if len(shape) < 2:
+                return 1, 1
+            ny, nx = int(shape[-2]), int(shape[-1])
+            max_points = max(2, int(max_points))
+            sy = max(1, int(np.ceil(ny / max_points)))
+            sx = max(1, int(np.ceil(nx / max_points)))
+            return sy, sx
+        except Exception:
+            return 1, 1
+
+    def _slice_like_grid(self, arr, sy, sx, ref_shape):
+        if arr is None:
+            return None
+        try:
+            a = np.asarray(arr)
+            if a.ndim >= 2 and tuple(a.shape[-2:]) == tuple(ref_shape[-2:]):
+                return a[..., ::sy, ::sx]
+            return arr
+        except Exception:
+            return arr
+
+    def downsample_plot_bundle(self, X, Y, Z, vx=None, vy=None, vmag=None, max_points=None):
+        """Downsample scalar/vector display arrays without changing physics data.
+
+        The returned arrays are for visualization only. The original simulation
+        output and all quantitative calculations remain untouched.
+        """
+        if hasattr(self, 'auto_downsample_toggle'):
+            self.auto_downsample_enabled = bool(self.auto_downsample_toggle.isChecked())
+        if not self.auto_downsample_enabled:
+            return X, Y, Z, vx, vy, vmag
+        if max_points is None:
+            max_points = int(self.max_display_res_spin.value()) if hasattr(self, 'max_display_res_spin') else self.max_display_points
+        try:
+            Zarr = np.asarray(Z)
+            if Zarr.ndim < 2:
+                return X, Y, Z, vx, vy, vmag
+            sy, sx = self._array_stride(Zarr.shape, max_points)
+            if sy == 1 and sx == 1:
+                return X, Y, Z, vx, vy, vmag
+            ref_shape = Zarr.shape
+            Xd = self._slice_like_grid(X, sy, sx, ref_shape)
+            Yd = self._slice_like_grid(Y, sy, sx, ref_shape)
+            Zd = Zarr[..., ::sy, ::sx]
+            vxd = self._slice_like_grid(vx, sy, sx, ref_shape)
+            vyd = self._slice_like_grid(vy, sy, sx, ref_shape)
+            vmd = self._slice_like_grid(vmag, sy, sx, ref_shape)
+            return Xd, Yd, Zd, vxd, vyd, vmd
+        except Exception:
+            return X, Y, Z, vx, vy, vmag
+
+    def downsample_vector_for_streamlines(self, X, Y, U, V, C=None, max_points=None):
+        if max_points is None:
+            max_points = int(self.stream_display_res_spin.value()) if hasattr(self, 'stream_display_res_spin') else self.max_stream_points
+        try:
+            Uarr = np.asarray(U)
+            if Uarr.ndim < 2:
+                return X, Y, U, V, C
+            sy, sx = self._array_stride(Uarr.shape, max_points)
+            if sy == 1 and sx == 1:
+                return X, Y, U, V, C
+            ref_shape = Uarr.shape
+            return (
+                self._slice_like_grid(X, sy, sx, ref_shape),
+                self._slice_like_grid(Y, sy, sx, ref_shape),
+                Uarr[..., ::sy, ::sx],
+                np.asarray(V)[..., ::sy, ::sx] if V is not None and np.asarray(V).ndim >= 2 else V,
+                np.asarray(C)[..., ::sy, ::sx] if C is not None and np.asarray(C).ndim >= 2 else C,
+            )
+        except Exception:
+            return X, Y, U, V, C
+
+    def reset_default_view(self):
+        self._safe_call("Restore default view", self._restore_default_view_state)
+        self._safe_call("Restore default view", self.plot_density)
 
     def show_sim_info(self):
         if self.sim is not None:
@@ -1453,6 +2226,8 @@ class PlotInteractiveWindow(QWidget):
 
     def on_slice_type_change(self, text):
         self.slice_type = text
+        if getattr(self, '_loading_simulation', False):
+            return
         if self._is_polar_2d():
             self._append_log("Polar 2D simulations use radial/azimuthal bounds only.", level='warning')
             self.plot_density()
@@ -1487,11 +2262,7 @@ class PlotInteractiveWindow(QWidget):
         self.r_max.setText("")
         self.last_slice_str = ""  # <-- Ensure previous slice is cleared
         # Reset fixed colorbar limits when changing slice type
-        self.fixed_cbar_limits = {
-            'Density': None,
-            'Velocity': None,
-            'Energy': None
-        }
+        self.fixed_cbar_limits = {}
         # Recalculate limits if fixed colorbar is enabled
         if self.fixed_cbar_enabled:
             self.update_fixed_cbar_limits()
@@ -1774,9 +2545,10 @@ class PlotInteractiveWindow(QWidget):
         self.plot_density()
 
     def on_map_change(self, text):
-        if text == 'Velocity':
-            self.vel_dropdown.setEnabled(True)
-        else:
+        try:
+            field_type = self.available_field_catalog().get(text)
+            self.vel_dropdown.setEnabled(field_type == 'vector')
+        except Exception:
             self.vel_dropdown.setEnabled(False)
 
     def on_fixed_cbar_toggle(self, state):
@@ -1792,42 +2564,42 @@ class PlotInteractiveWindow(QWidget):
 
     def update_fixed_cbar_limits(self):
         slice_str = self.build_slice_str()
-        res = self.res_slider.value()
-        interpolate = self.interp_toggle.isChecked()
-        map_types = MAP_TYPES
+        slice_arg = slice_str if str(slice_str).strip() else None
+        requested_res = int(self.res_slider.value())
+        res = self.effective_display_resolution(requested_res)
         vel_comp = self.vel_dropdown.currentText() if hasattr(self, 'vel_dropdown') else 'vx'
         snap = self.fixed_cbar_snap_spin.value()
-        selected_field = self.field_dropdown.currentText().strip() if hasattr(self, 'field_dropdown') else ''
-        try:
-            field_catalog = self.sim.available_fields(snapshot=snap)
-        except Exception:
-            field_catalog = {}
+        selected_field = self.selected_field_name()
+        field_catalog = self.available_field_catalog(snapshot=snap)
         selected_field_type = field_catalog.get(selected_field)
-        scalar_field_name = selected_field if selected_field and selected_field_type == 'scalar' else None
-        vector_field_name = selected_field if selected_field and selected_field_type == 'vector' else None
         load_coords = 'cartesian'
 
-        # Determine axes and mesh names based on fixed coordinates (same logic as plot_density)
+        # The fixed colorbar must be associated with the actual output field
+        # selected by the user, e.g. gasdens, dust1dens, gasenergy, gasv, etc.
+        # Do not use a hard-coded MAP_TYPES list here.
+        if not selected_field:
+            return
+
+        limit_key = selected_field
+
         def is_fixed(var, slice_str):
-            # Match both single values (var=X) and ranges with equal values (var=[X,X])
+            if not slice_str:
+                return False
             slice_clean = slice_str.replace(' ', '')
             single_match = re.search(rf'{var}=([^\[\],]+)', slice_clean)
             if single_match:
                 return True
-            # Also check for ranges where min==max
             range_match = re.search(rf'{var}=\[([^,]+),([^\]]+)\]', slice_clean)
             if range_match:
                 try:
                     val1, val2 = float(range_match.group(1)), float(range_match.group(2))
-                    if abs(val1 - val2) < 1e-10:
-                        return True
+                    return abs(val1 - val2) < 1e-10
                 except ValueError:
-                    pass
+                    return False
             return False
 
         polar_native = self._is_polar_2d()
 
-        # Check for theta (spherical) or z (cylindrical) being fixed
         if polar_native:
             mesh_x_name = 'var1_mesh'
             mesh_y_name = 'var2_mesh'
@@ -1845,97 +2617,69 @@ class PlotInteractiveWindow(QWidget):
             mesh_y_name = 'var2_mesh'
             use_var3 = False
 
-        for map_type in map_types:
-            try:
-                if map_type == 'Density':
-                    density_field = scalar_field_name or 'gasdens'
-                    vector_field = vector_field_name or 'gasv'
-                    data = self.sim.load_field(
-                        fields=[density_field, vector_field],
-                        slice=slice_str,
-                        snapshot=snap,
-                        coords=load_coords
-                    )
-                    if hasattr(data, 'evaluate'):
-                        xmin, xmax = getattr(data, mesh_x_name)[0].min(), getattr(data, mesh_x_name)[0].max()
-                        ymin, ymax = getattr(data, mesh_y_name)[0].min(), getattr(data, mesh_y_name)[0].max()
-                        xs = np.linspace(xmin, xmax, res)
-                        ys = np.linspace(ymin, ymax, res)
-                        X, Y = np.meshgrid(xs, ys)
-                        if use_var3:
-                            data_map = data.evaluate(field=density_field, time=snap, var1=X, var3=Y, coords='cartesian')
-                        else:
-                            data_map = data.evaluate(field=density_field, time=snap, var1=X, var2=Y, coords='cartesian')
-                        dens_raw = data_map * self.sim.URHO
-                        data_map = np.where(dens_raw > 0, np.log10(dens_raw), np.nan)
+        try:
+            field_data = self.sim.load_field(
+                fields=selected_field,
+                slice=slice_arg,
+                snapshot=snap,
+                coords=load_coords
+            )
+
+            if hasattr(field_data, 'evaluate'):
+                xmin = getattr(field_data, mesh_x_name)[0].min()
+                xmax = getattr(field_data, mesh_x_name)[0].max()
+                ymin = getattr(field_data, mesh_y_name)[0].min()
+                ymax = getattr(field_data, mesh_y_name)[0].max()
+                xs = np.linspace(xmin, xmax, res)
+                ys = np.linspace(ymin, ymax, res)
+                X, Y = np.meshgrid(xs, ys)
+
+                if selected_field_type == 'vector':
+                    if use_var3:
+                        values = field_data.evaluate(field=selected_field, time=snap, var1=X, var3=Y, coords=load_coords)
                     else:
-                        dens_raw = getattr(data, f'{density_field}_mesh')[0] * self.sim.URHO
-                        valid_mask = dens_raw > 0
-                        data_map = np.where(valid_mask, np.log10(dens_raw), np.nan)
-                elif map_type == 'Velocity':
-                    vector_field = vector_field_name or 'gasv'
-                    gasv = self.sim.load_field(
-                        fields=vector_field,
-                        slice=slice_str,
-                        snapshot=snap,
-                        coords=load_coords
-                    )
-                    
-                    if hasattr(gasv, 'evaluate'):
-                        xmin, xmax = getattr(gasv, mesh_x_name)[0].min(), getattr(gasv, mesh_x_name)[0].max()
-                        ymin, ymax = getattr(gasv, mesh_y_name)[0].min(), getattr(gasv, mesh_y_name)[0].max()
-                        xs = np.linspace(xmin, xmax, res)
-                        ys = np.linspace(ymin, ymax, res)
-                        X, Y = np.meshgrid(xs, ys)
-                        if use_var3:
-                            vel = gasv.evaluate(field=vector_field, time=snap, var1=X, var3=Y, coords='cartesian')
-                        else:
-                            vel = gasv.evaluate(field=vector_field, time=snap, var1=X, var2=Y, coords='cartesian')
-                        idx = VEL_INDEX.get(vel_comp, 0)
-                        # Convert to km/s (consistent with plot_density)
-                        v_factor = self.sim.UL / self.sim.UT
-                        sim_unitsys = getattr(self.sim, "unitsystem", "cgs").lower()
-                        denom = 1e5 if sim_unitsys == "cgs" else 1e3
-                        data_map = (vel[idx] * v_factor) / denom
-                    else:
-                        vel = getattr(gasv, f'{vector_field}_mesh')[0]
-                        idx = VEL_INDEX.get(vel_comp, 0)
-                        # Convert to km/s (consistent with plot_density)
-                        v_factor = self.sim.UL / self.sim.UT
-                        sim_unitsys = getattr(self.sim, "unitsystem", "cgs").lower()
-                        denom = 1e5 if sim_unitsys == "cgs" else 1e3
-                        data_map = (vel[idx] * v_factor) / denom
-                elif map_type == 'Energy':
-                    energy_field = scalar_field_name or 'gasenergy'
-                    vector_field = vector_field_name or 'gasv'
-                    gasenergy = self.sim.load_field(
-                        fields=energy_field,
-                        slice=slice_str,
-                        snapshot=snap,
-                        coords=load_coords
-                    )
-                    if hasattr(gasenergy, 'evaluate'):
-                        xmin, xmax = getattr(gasenergy, mesh_x_name)[0].min(), getattr(gasenergy, mesh_x_name)[0].max()
-                        ymin, ymax = getattr(gasenergy, mesh_y_name)[0].min(), getattr(gasenergy, mesh_y_name)[0].max()
-                        xs = np.linspace(xmin, xmax, res)
-                        ys = np.linspace(ymin, ymax, res)
-                        X, Y = np.meshgrid(xs, ys)
-                        if use_var3:
-                            data_map = gasenergy.evaluate(field=energy_field, time=snap, var1=X, var3=Y, coords='cartesian')
-                        else:
-                            data_map = gasenergy.evaluate(field=energy_field, time=snap, var1=X, var2=Y, coords='cartesian')
-                    else:
-                        data_map = getattr(gasenergy, f'{energy_field}_mesh')[0]
-                # Ignore NaNs for min/max
-                valid = np.isfinite(data_map)
-                if np.any(valid):
-                    vmin = np.nanmin(data_map)
-                    vmax = np.nanmax(data_map)
-                    self.fixed_cbar_limits[map_type] = (vmin, vmax)
+                        values = field_data.evaluate(field=selected_field, time=snap, var1=X, var2=Y, coords=load_coords)
+                    idx = VEL_INDEX.get(vel_comp, 0)
+                    v_factor = self.sim.UL / self.sim.UT
+                    sim_unitsys = getattr(self.sim, "unitsystem", "cgs").lower()
+                    denom = 1e5 if sim_unitsys == "cgs" else 1e3
+                    data_map = (values[idx] * v_factor) / denom
                 else:
-                    self.fixed_cbar_limits[map_type] = None
+                    if use_var3:
+                        values = field_data.evaluate(field=selected_field, time=snap, var1=X, var3=Y, coords=load_coords)
+                    else:
+                        values = field_data.evaluate(field=selected_field, time=snap, var1=X, var2=Y, coords=load_coords)
+                    values_phys = values * self.sim.URHO
+                    data_map = np.where(values_phys > 0, np.log10(values_phys), np.nan)
+            else:
+                mesh_attr = f'{selected_field}_mesh'
+                if not hasattr(field_data, mesh_attr):
+                    self.fixed_cbar_limits[limit_key] = None
+                    return
+                values = getattr(field_data, mesh_attr)[0]
+
+                if selected_field_type == 'vector':
+                    idx = VEL_INDEX.get(vel_comp, 0)
+                    v_factor = self.sim.UL / self.sim.UT
+                    sim_unitsys = getattr(self.sim, "unitsystem", "cgs").lower()
+                    denom = 1e5 if sim_unitsys == "cgs" else 1e3
+                    data_map = (values[idx] * v_factor) / denom
+                else:
+                    values_phys = values * self.sim.URHO
+                    data_map = np.where(values_phys > 0, np.log10(values_phys), np.nan)
+
+            valid = np.isfinite(data_map)
+            if np.any(valid):
+                self.fixed_cbar_limits[limit_key] = (float(np.nanmin(data_map)), float(np.nanmax(data_map)))
+            else:
+                self.fixed_cbar_limits[limit_key] = None
+
+        except Exception as exc:
+            self.fixed_cbar_limits[limit_key] = None
+            try:
+                self._append_log(f"Could not compute fixed colorbar limits for {selected_field}: {exc}", level='error')
             except Exception:
-                self.fixed_cbar_limits[map_type] = None
+                pass
 
     def _plot_reflection_overlay(self, ax, X_plot, Y_plot, data_map, cmap, vmin, vmax,
                                  show_streamlines, stream_density, stream_cmap,
@@ -2007,6 +2751,8 @@ class PlotInteractiveWindow(QWidget):
             )
 
     def plot_density(self, unitsys_override=None):
+        if getattr(self, '_loading_simulation', False):
+            return
         return self._safe_call("Plot update", self._plot_density_impl, unitsys_override)
 
     def _plot_density_impl(self, unitsys_override=None):
@@ -2017,25 +2763,35 @@ class PlotInteractiveWindow(QWidget):
         QApplication.processEvents()
 
         slice_str = self.build_slice_str()
-        res = self.res_slider.value()
+        slice_arg = slice_str if str(slice_str).strip() else None
+        requested_res = int(self.res_slider.value())
         interpolate = self.interp_toggle.isChecked()
+        res = self.effective_display_resolution(requested_res) if interpolate else requested_res
         show_streamlines = self.streamlines_toggle.isChecked()
         stream_density = self.density_slider.value()
         hill_frac = self.hill_frac_slider.value()
         show_circle = self.show_circle_toggle.isChecked()
         cmap = self.cmap_dropdown.currentText()
         stream_cmap = self.stream_cmap_dropdown.currentText()
-        map_type = self.map_dropdown.currentText()
+        selected_field = self.selected_field_name()
         vel_comp = self.vel_dropdown.currentText()
         n = self.time_slider.value()
-        selected_field = self.field_dropdown.currentText().strip() if hasattr(self, 'field_dropdown') else ''
-        try:
-            field_catalog = self.sim.available_fields(snapshot=n)
-        except Exception:
-            field_catalog = {}
+        field_catalog = self.available_field_catalog(snapshot=n)
         selected_field_type = field_catalog.get(selected_field)
         scalar_field_name = selected_field if selected_field and selected_field_type == 'scalar' else None
         vector_field_name = selected_field if selected_field and selected_field_type == 'vector' else None
+
+        # Initialize helpers to avoid UnboundLocalError in error paths
+        density_field = self._pick_field_by_type('scalar', selected_field, snapshot=n) or 'gasdens'
+        energy_field = self._pick_field_by_type('scalar', 'gasenergy', snapshot=n) or 'gasenergy'
+        vector_field = self._pick_field_by_type('vector', selected_field, snapshot=n) if selected_field_type == 'vector' else None
+
+        if not selected_field:
+            self._append_log('No field selected.', level='warning')
+            return
+
+        map_type = 'Velocity' if selected_field_type == 'vector' else 'Density'
+        load_coords = 'cartesian'
 
         # --- UNITS ---
         sim_unitsys = getattr(self.sim, "unitsystem", "cgs").lower()
@@ -2061,8 +2817,10 @@ class PlotInteractiveWindow(QWidget):
             v_factor = self.sim.UL / self.sim.UT  # cm/s
         # Determine axes and mesh names based on fixed coordinates
         def is_fixed(var, slice_str):
+            if not slice_str:
+                return False
             # Match both single values (var=X) and ranges with equal values (var=[X,X])
-            slice_clean = slice_str.replace(' ', '')
+            slice_clean = str(slice_str).replace(' ', '')
             single_match = re.search(rf'{var}=([^\[\],]+)', slice_clean)
             if single_match:
                 return True
@@ -2078,6 +2836,17 @@ class PlotInteractiveWindow(QWidget):
             return False
 
         polar_native = self._is_polar_2d()
+
+        # Assign canonical names used in this function
+        density_field = selected_field if selected_field_type == 'scalar' else None
+        vector_field = selected_field if selected_field_type == 'vector' else None
+
+        if map_type == 'Density' and density_field is None:
+            self._append_log('The selected field is not scalar.', level='warning')
+            return
+        if map_type == 'Velocity' and vector_field is None:
+            self._append_log('The selected field is not vectorial.', level='warning')
+            return
 
         # Check for theta (spherical) or z (cylindrical) being fixed
         if polar_native:
@@ -2100,43 +2869,32 @@ class PlotInteractiveWindow(QWidget):
         # Load data according to selection
         load_coords = 'cartesian' if polar_native else 'cartesian'
         if map_type == 'Density':
-            density_field = scalar_field_name or 'gasdens'
-            vector_field = vector_field_name or 'gasv'
+            # If streamlines or vector evaluation is requested alongside a
+            # scalar map, ensure the vector companion field is also loaded
+            fields_to_load = [density_field]
+            if (show_streamlines or interpolate) and vector_field is None:
+                # Try to resolve a companion vector field heuristically
+                vector_field = self._resolve_streamline_vector_field(density_field, snapshot=n)
+            if vector_field is not None:
+                fields_to_load.append(vector_field)
+
             data = self.sim.load_field(
-                fields=[density_field, vector_field],
-                slice=slice_str,
+                fields=fields_to_load,
+                slice=slice_arg,
                 snapshot=n,
                 coords=load_coords
             )
-        elif map_type == 'Energy':
-            energy_field = scalar_field_name or 'gasenergy'
-            vector_field = vector_field_name or 'gasv'
-            gasenergy = self.sim.load_field(
-                fields=energy_field,
-                slice=slice_str,
-                snapshot=n,
-                coords=load_coords
-            )
-            gasv = self.sim.load_field(
-                fields=vector_field,
-                slice=slice_str,
-                snapshot=n,
-                coords=load_coords
-            )
-        elif map_type == 'Velocity':
-            vector_field = vector_field_name or 'gasv'
-            gasv = self.sim.load_field(
-                fields=vector_field,
-                slice=slice_str,
-                snapshot=n,
-                coords=load_coords
-            )
+            if map_type == 'Velocity':
+                gasv = self.sim.load_field(
+                    fields=vector_field,
+                    slice=slice_arg,
+                    snapshot=n,
+                    coords=load_coords
+                )
 
         # Select the object that provides the mesh arrays (used for xmin/xmax/ymin/ymax)
         if map_type == 'Density':
             mesh_source = data
-        elif map_type == 'Energy':
-            mesh_source = gasenergy
         else:  # Velocity
             mesh_source = gasv
 
@@ -2151,16 +2909,18 @@ class PlotInteractiveWindow(QWidget):
                 if map_type == 'Density':
                     data_map = data.evaluate(field=density_field, time=n, var1=X, var2=Y, coords='cartesian')
                     data_map = np.log10(data_map * self.sim.URHO)
-                    vel = data.evaluate(field=vector_field, time=n, var1=X, var2=Y, coords='cartesian')
-                    vx = vel[0]
-                    vy = vel[1]
-                    vmag = np.sqrt(vx**2 + vy**2)
+                    if vector_field is not None:
+                        vel = data.evaluate(field=vector_field, time=n, var1=X, var2=Y, coords='cartesian')
+                        vx = vel[0]
+                        vy = vel[1]
+                        vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Energy':
                     data_map = gasenergy.evaluate(field=energy_field, time=n, var1=X, var2=Y, coords='cartesian')
-                    vel = gasv.evaluate(time=n, var1=X, var2=Y, coords='cartesian')
-                    vx = vel[0]
-                    vy = vel[1]
-                    vmag = np.sqrt(vx**2 + vy**2)
+                    if gasv is not None:
+                        vel = gasv.evaluate(time=n, var1=X, var2=Y, coords='cartesian')
+                        vx = vel[0]
+                        vy = vel[1]
+                        vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Velocity':
                     vel = gasv.evaluate(time=n, var1=X, var2=Y, coords='cartesian')
                     idx = VEL_INDEX[vel_comp]
@@ -2177,16 +2937,18 @@ class PlotInteractiveWindow(QWidget):
                 if map_type == 'Density':
                     data_map = data.evaluate(field=density_field, time=n, var1=X, var2=Y, coords='cartesian')
                     data_map = np.log10(data_map * self.sim.URHO)
-                    vel = data.evaluate(field=vector_field, time=n, var1=X, var2=Y, coords='cartesian')
-                    vx = vel[0]
-                    vy = vel[2]
-                    vmag = np.sqrt(vx**2 + vy**2)
+                    if vector_field is not None:
+                        vel = data.evaluate(field=vector_field, time=n, var1=X, var2=Y, coords='cartesian')
+                        vx = vel[0]
+                        vy = vel[2]
+                        vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Energy':
                     data_map = gasenergy.evaluate(field=energy_field, time=n, var1=X, var2=Y, coords='cartesian')
-                    vel = gasv.evaluate(time=n, var1=X, var2=Y, coords='cartesian')
-                    vx = vel[0]
-                    vy = vel[2]
-                    vmag = np.sqrt(vx**2 + vy**2)
+                    if gasv is not None:
+                        vel = gasv.evaluate(time=n, var1=X, var2=Y, coords='cartesian')
+                        vx = vel[0]
+                        vy = vel[2]
+                        vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Velocity':
                     vel = gasv.evaluate(time=n, var1=X, var2=Y, coords='cartesian')
                     idx = VEL_INDEX[vel_comp]
@@ -2200,16 +2962,18 @@ class PlotInteractiveWindow(QWidget):
                 Y = getattr(mesh_source, mesh_y_name)[0]
                 if map_type == 'Density':
                     data_map = np.log10(getattr(data, f'{density_field}_mesh')[0] * self.sim.URHO)
-                    vel = getattr(data, f'{vector_field}_mesh')[0]
-                    vx = vel[0]
-                    vy = vel[1]
-                    vmag = np.sqrt(vx**2 + vy**2)
+                    if vector_field is not None:
+                        vel = getattr(data, f'{vector_field}_mesh')[0]
+                        vx = vel[0]
+                        vy = vel[1]
+                        vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Energy':
                     data_map = getattr(gasenergy, f'{energy_field}_mesh')[0]
-                    vel = getattr(gasv, f'{vector_field}_mesh')[0]
-                    vx = vel[0]
-                    vy = vel[1]
-                    vmag = np.sqrt(vx**2 + vy**2)
+                    if gasv is not None:
+                        vel = getattr(gasv, f'{vector_field}_mesh')[0]
+                        vx = vel[0]
+                        vy = vel[1]
+                        vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Velocity':
                     vel = getattr(gasv, f'{vector_field}_mesh')[0]
                     idx = VEL_INDEX[vel_comp]
@@ -2222,16 +2986,18 @@ class PlotInteractiveWindow(QWidget):
                 Y = getattr(mesh_source, mesh_y_name)[0]
                 if map_type == 'Density':
                     data_map = np.log10(getattr(data, f'{density_field}_mesh')[0] * self.sim.URHO)
-                    vel = getattr(data, f'{vector_field}_mesh')[0]
-                    vx = vel[0]
-                    vy = vel[2]
-                    vmag = np.sqrt(vx**2 + vy**2)
+                    if vector_field is not None:
+                        vel = getattr(data, f'{vector_field}_mesh')[0]
+                        vx = vel[0]
+                        vy = vel[2]
+                        vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Energy':
                     data_map = getattr(gasenergy, f'{energy_field}_mesh')[0]
-                    vel = getattr(gasv, f'{vector_field}_mesh')[0]
-                    vx = vel[0]
-                    vy = vel[2]
-                    vmag = np.sqrt(vx**2 + vy**2)
+                    if gasv is not None:
+                        vel = getattr(gasv, f'{vector_field}_mesh')[0]
+                        vx = vel[0]
+                        vy = vel[2]
+                        vmag = np.sqrt(vx**2 + vy**2)
                 elif map_type == 'Velocity':
                     vel = getattr(gasv, f'{vector_field}_mesh')[0]
                     idx = {'vx': 0, 'vy': 1, 'vz': 2}[vel_comp]
@@ -2300,7 +3066,7 @@ class PlotInteractiveWindow(QWidget):
         # r in plot units (same as X_plot/Y_plot)
         r = np.sqrt(X_plot**2 + Y_plot**2)
         # Extract r_min/r_max from slice_str (these are in the original simulation units, no rescaling)
-        r_match = re.search(r"r=\[([0-9\.]+),([0-9\.]+)\]", slice_str.replace(" ", ""))
+        r_match = re.search(r"r=\[([0-9\.]+),([0-9\.]+)\]", str(slice_str or "").replace(" ", ""))
         if r_match:
             # r_min_sim and r_max_sim are in simulation units (no rescaling)
             r_min_sim = float(r_match.group(1))
@@ -2321,21 +3087,58 @@ class PlotInteractiveWindow(QWidget):
                 vy = np.where(mask, vy, np.nan)
                 vmag = np.where(mask, vmag, np.nan)
 
-        self.figure.clear()
-        ax = self.figure.add_subplot(111)
-        ax.set_facecolor('white')
-        self.figure.set_facecolor('white')
+        X_plot = np.asarray(X_plot)
+        Y_plot = np.asarray(Y_plot)
+        data_map = np.asarray(data_map)
+
+        # --- Level-of-detail for interactive display ---
+        # Downsample only the arrays sent to Matplotlib. This keeps the GUI
+        # responsive for very large outputs while preserving the simulation data.
+        X_plot, Y_plot, data_map, vx_plot, vy_plot, vmag_kms = self.downsample_plot_bundle(
+            X_plot, Y_plot, data_map, vx_plot, vy_plot, vmag_kms
+        )
+        X_plot = np.asarray(X_plot)
+        Y_plot = np.asarray(Y_plot)
+        data_map = np.asarray(data_map)
 
         # --- Set colorbar limits if fixed colorbar is enabled or manual vmin/vmax is enabled ---
         vmin = vmax = None
         if self.manual_vmin_vmax_enabled:
-            # User provides exponent x; values are treated as 10^x (manual vmin/vmax)
             vmin = self.manual_vmin
             vmax = self.manual_vmax
         elif self.fixed_cbar_enabled:
-            limits = self.fixed_cbar_limits.get(map_type)
+            limit_key = selected_field if selected_field else map_type
+            limits = self.fixed_cbar_limits.get(limit_key)
             if limits is not None:
                 vmin, vmax = limits
+
+        # --- Fast playback path: update the existing QuadMesh when possible ---
+        current_signature = self.plot_state_signature(slice_str=slice_arg)
+        if self.can_use_fast_pcolormesh_update(current_signature, data_map):
+            try:
+                self._main_pcm.set_array(data_map.ravel())
+                self._main_pcm.set_cmap(cmap)
+                if vmin is not None and vmax is not None:
+                    self._main_pcm.set_clim(vmin, vmax)
+                elif not self.fixed_cbar_enabled and not self.manual_vmin_vmax_enabled:
+                    valid = np.isfinite(data_map)
+                    if np.any(valid):
+                        self._main_pcm.set_clim(float(np.nanmin(data_map[valid])), float(np.nanmax(data_map[valid])))
+                if getattr(self, '_main_cbar', None) is not None:
+                    try:
+                        self._main_cbar.update_normal(self._main_pcm)
+                    except Exception:
+                        pass
+                self.canvas.draw_idle()
+                QTimer.singleShot(200, lambda: self.status_label.setText(""))
+                return
+            except Exception as exc:
+                print(f"Fast playback update failed; rebuilding plot: {exc}")
+
+        self.figure.clear()
+        ax = self.figure.add_subplot(111)
+        ax.set_facecolor('white')
+        self.figure.set_facecolor('white')
 
         # Defensive: ensure X_plot/Y_plot/data_map have compatible shapes
         X_plot = np.asarray(X_plot)
@@ -2444,6 +3247,7 @@ class PlotInteractiveWindow(QWidget):
                     return X, Y, U, V, vm
 
             Xs, Ys, vxs, vys, vms = _sanitize_grid(X_plot, Y_plot, vx_plot, vy_plot, vmag_kms)
+            Xs, Ys, vxs, vys, vms = self.downsample_vector_for_streamlines(Xs, Ys, vxs, vys, vms)
             stream_obj = ax.streamplot(
                 Xs, Ys, vxs, vys,
                 color=vms if vms is not None else None,
@@ -2477,16 +3281,19 @@ class PlotInteractiveWindow(QWidget):
                     # Interpolate reflected fields on that mesh depending on map type
                     try:
                         if map_type == 'Density':
-                            data_map_ref = mesh_source.evaluate(field='gasdens', time=n, var1=V1, var3=V3, reflect=True)
+                            data_map_ref = mesh_source.evaluate(field=density_field, time=n, var1=V1, var3=V3, reflect=True)
                             # Match main path: convert to log10 density in physical units
                             data_map_ref = np.log10(data_map_ref * self.sim.URHO)
                             # Also get velocity for streamlines
-                            vel_ref = mesh_source.evaluate(field='gasv', time=n, var1=V1, var3=V3, reflect=True)
+                            if vector_field is not None:
+                                vel_ref = mesh_source.evaluate(field=vector_field, time=n, var1=V1, var3=V3, reflect=True)
+                            else:
+                                vel_ref = None
                         elif map_type == 'Energy':
-                            data_map_ref = mesh_source.evaluate(field='gasenergy', time=n, var1=V1, var3=V3, reflect=True)
-                            vel_ref = mesh_source.evaluate(field='gasv', time=n, var1=V1, var3=V3, reflect=True)
+                            data_map_ref = mesh_source.evaluate(field=energy_field, time=n, var1=V1, var3=V3, reflect=True)
+                            vel_ref = mesh_source.evaluate(field=vector_field, time=n, var1=V1, var3=V3, reflect=True) if vector_field is not None else None
                         else:  # Velocity
-                            vel_ref = mesh_source.evaluate(field='gasv', time=n, var1=V1, var3=V3, reflect=True)
+                            vel_ref = mesh_source.evaluate(field=vector_field, time=n, var1=V1, var3=V3, reflect=True)
                             idx_ref = VEL_INDEX.get(vel_comp, 0)
                             data_map_ref = vel_ref[idx_ref]
 
@@ -2496,15 +3303,21 @@ class PlotInteractiveWindow(QWidget):
 
                         # Convert velocities to plot units and compute vmr_kms as in main path
                         try:
-                            vxr_plot = (vel_ref[0] * v_factor) / scale_factor
-                            vyr_plot = (vel_ref[2] * v_factor) / scale_factor
+                            if vel_ref is not None:
+                                vxr_plot = (vel_ref[0] * v_factor) / scale_factor
+                                vyr_plot = (vel_ref[2] * v_factor) / scale_factor
+                            else:
+                                vxr_plot = vyr_plot = None
                         except Exception:
                             vxr_plot = vyr_plot = None
 
                         try:
-                            vmag_phys_ref = np.sqrt((vel_ref[0] * v_factor)**2 + (vel_ref[2] * v_factor)**2)
-                            denom = 1e5 if sim_unitsys == 'cgs' else 1e3
-                            vmr_kms = vmag_phys_ref / denom
+                            if vel_ref is not None:
+                                vmag_phys_ref = np.sqrt((vel_ref[0] * v_factor)**2 + (vel_ref[2] * v_factor)**2)
+                                denom = 1e5 if sim_unitsys == 'cgs' else 1e3
+                                vmr_kms = vmag_phys_ref / denom
+                            else:
+                                vmr_kms = None
                         except Exception:
                             vmr_kms = None
 
@@ -2594,30 +3407,44 @@ class PlotInteractiveWindow(QWidget):
 
         planets = self.sim.load_planets(snapshot=n)
         if planets:
-            center_x = planets[0].pos.x * self.sim.UL / scale_factor
-            center_y = planets[0].pos.y * self.sim.UL / scale_factor
-            radius = hill_frac * planets[0].hill_radius * self.sim.UL / scale_factor
+            try:
+                selected_data = self.hill_planet_combo.currentData()
+                planet_index = int(selected_data) if selected_data is not None else int(self.hill_planet_combo.currentIndex())
+            except Exception:
+                planet_index = 0
+            planet_index = max(0, min(planet_index, len(planets) - 1))
+            planet = planets[planet_index]
+
+            center_x = planet.pos.x * self.sim.UL / scale_factor
+            center_y = planet.pos.y * self.sim.UL / scale_factor
+            radius = hill_frac * planet.hill_radius * self.sim.UL / scale_factor
         else:
             center_x = 0
             center_y = 0
             radius = 0
 
         hill_color = getattr(self, "hill_color", "red")
-        if show_circle:
-            # Check for theta (spherical) or z (cylindrical) being fixed
-            if is_fixed('theta', slice_str) or is_fixed('z', slice_str):
-                from matplotlib.patches import Circle
-                circle = Circle((center_x, center_y), radius, color=hill_color, fill=False, linestyle='--', linewidth=3,label=fr'${hill_frac:.1f}\,R_H$')
+        if show_circle and radius > 0:
+            from matplotlib.patches import Circle
+            if polar_native or is_fixed('theta', slice_str) or is_fixed('z', slice_str):
+                circle = Circle(
+                    (center_x, center_y),
+                    radius,
+                    color=hill_color,
+                    fill=False,
+                    linestyle='--',
+                    linewidth=3,
+                    label=fr'${hill_frac:.1f}\,R_H$'
+                )
                 ax.add_patch(circle)
             elif is_fixed('phi', slice_str):
-                # If reflection overlay is enabled, draw full circle
                 if getattr(self, 'reflect_enabled', False):
                     theta = np.linspace(0, 2 * np.pi, 200)
                 else:
                     theta = np.linspace(0, np.pi, 100)
                 x = center_x + radius * np.cos(theta)
                 y = center_y + radius * np.sin(theta)
-                ax.plot(x, y, color=hill_color, linewidth=3, label=f'{hill_frac:.1f}'+r'$R_H$', linestyle='--')
+                ax.plot(x, y, color=hill_color, linewidth=3, label=fr'${hill_frac:.1f}\,R_H$', linestyle='--')
 
         # Change font and size of axis labels
         font_properties = {'fontsize': 15, 'fontname': 'Serif'}
@@ -2625,7 +3452,9 @@ class PlotInteractiveWindow(QWidget):
         ax.set_ylabel(ylabel, **font_properties)
         fp.Plot.fargopy_mark(ax)
         ax.legend(fontsize=15, prop={'family': 'Serif'}, loc='upper left')
-        ax.grid(0.1)
+        
+
+        cbar = None
 
         # --- Colorbar label ---
         if show_streamlines and stream_obj is not None and vmag_kms is not None:
@@ -2678,6 +3507,34 @@ class PlotInteractiveWindow(QWidget):
                     cbar.set_label(cbar_label, fontsize=label_fontsize, fontname='Serif')
                 except Exception as e:
                     print(f"Warning: Could not create fallback colorbar: {e}")
+
+        # Store references used by the fast playback path.
+        self._main_pcm = pcm
+        self._main_cbar = cbar
+        self._last_plot_signature = current_signature
+        self._last_data_shape = tuple(np.asarray(data_map).shape) if data_map is not None else None
+
+        # Store simple display frames for smooth back/forward playback.
+        # Complex overlays are excluded by _simple_plot_cache_allowed().
+        try:
+            if pcm is not None and self._simple_plot_cache_allowed():
+                self._put_plot_cache(
+                    self._plot_cache_key(current_signature, n),
+                    {
+                        'X': np.asarray(X_plot).copy(),
+                        'Y': np.asarray(Y_plot).copy(),
+                        'Z': np.asarray(data_map).copy(),
+                        'cmap': cmap,
+                        'vmin': vmin,
+                        'vmax': vmax,
+                        'xlabel': xlabel,
+                        'ylabel': ylabel,
+                        'cbar_label': cbar_label if 'cbar_label' in locals() else '',
+                        'signature': current_signature,
+                    }
+                )
+        except Exception:
+            pass
 
         self.canvas.draw()
         QTimer.singleShot(800, lambda: self.status_label.setText(""))
@@ -2794,7 +3651,7 @@ if __name__ == "__main__":
     window = PlotInteractiveWindow()
     sys.excepthook = window._qt_exception_hook
     window.setWindowTitle("FARGOpy Interactive Plot")
-    window.resize(1350, 800)
+    window.resize(1620, 960)
     window.show()
     print("Window shown. Running app...")
     sys.exit(app.exec_())
