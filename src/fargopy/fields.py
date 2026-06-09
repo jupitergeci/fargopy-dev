@@ -937,6 +937,7 @@ class FieldInterpolator(fargopy.Fargobj):
                 normalized.append(f)
 
         self.fields = normalized
+        fields = normalized
         self.slice = slice
 
         # Convert snapshot into list - handle int, numpy types, and iterables

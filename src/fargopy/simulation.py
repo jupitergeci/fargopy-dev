@@ -1580,84 +1580,168 @@ class Simulation(fargopy.Fargobj):
         else:
             raise AssertionError(f"File with field '{file}' not found")
 
-    def available_fields(self, snapshot=0):
-        """Return the field names detected in the output directory for a snapshot.
+    def _field_cell_count(self):
+        """Return the number of active cells expected in each FARGO3D field file."""
+        if not hasattr(self, "vars") or self.vars is None:
+            raise ValueError("Simulation variables are not loaded; cannot infer field sizes.")
+        try:
+            return int(self.vars.NX) * int(self.vars.NY) * int(getattr(self.vars, "NZ", 1))
+        except Exception as exc:
+            raise ValueError("NX, NY and NZ must be available before detecting fields.") from exc
 
-        Scalar fields are files named ``<field><snapshot>.dat``. Vector fields are
-        detected when the matching ``x``/``y`` components exist and, for 3D
-        simulations, the ``z`` component also exists.
+    def _field_file_has_grid_size(self, filename):
+        """Return True only for binary FARGO3D field files with one mesh value per cell."""
+        path = os.path.join(self.output_dir, filename)
+        if not os.path.isfile(path):
+            return False
+        try:
+            size = os.path.getsize(path)
+            ncell = self._field_cell_count()
+        except Exception:
+            return False
+        # FARGO3D writes scalar datacubes as one float or double per active cell.
+        return size in (4 * ncell, 8 * ncell)
+
+    @staticmethod
+    def _looks_like_fargo3d_field_stem(stem):
+        """Conservative lexical filter for physical FARGO3D field stems.
+
+        The size check is the primary guard against summary/monitoring/planet files.
+        This filter rejects the most common non-field outputs before grouping, while
+        accepting gas fields, multifluid dust fields, MHD fields and user-defined
+        datacube fields whose names follow FARGO3D's lower-case convention.
+        """
+        if not stem or not re.match(r"^[a-z][a-z0-9_]*$", stem):
+            return False
+        excluded_prefixes = (
+            "summary", "planet", "bigplanet", "orbit", "orbir", "tqwk",
+            "domain_", "grid", "dims", "used_rad", "variables", "monitor",
+        )
+        return not stem.startswith(excluded_prefixes)
+
+    def _vector_components_for_dimension(self):
+        dim = int(getattr(self.vars, "DIM", 3))
+        return ["x", "y"] + (["z"] if dim == 3 else [])
+
+    def _canonical_field_name(self, field, snapshot=0):
+        """Return the canonical name used internally for a field request.
+
+        FARGO3D writes vector components as ``<base>x``, ``<base>y`` and
+        optionally ``<base>z``. FARGOpy stores them under the common vector base,
+        e.g. ``gasvx/gasvy/gasvz`` -> ``gasv`` and ``dust1vx/...`` -> ``dust1v``.
+        Scalar names such as ``gasdens`` and ``dust1dens`` are returned unchanged.
+        """
+        if not isinstance(field, str):
+            return field
+        field = field.strip()
+        detected = self.available_fields(snapshot=snapshot)
+        if field in detected:
+            return field
+        if len(field) > 1 and field[-1] in ("x", "y", "z"):
+            base = field[:-1]
+            if detected.get(base) == "vector":
+                return base
+        return field
+
+    @staticmethod
+    def _split_numbered_dat_filename(filename):
+        """Split ``<field><snapshot>.dat`` into ``(field, snapshot)``.
+
+        The snapshot number is parsed as the final contiguous digit block before
+        ``.dat``. This avoids the previous false match where ``gasdens10.dat``
+        was accepted while asking for snapshot 0 because it also ends in
+        ``0.dat``.
+        """
+        match = re.match(r"^(.+?)(\d+)\.dat$", os.path.basename(str(filename)))
+        if not match:
+            return None, None
+        return match.group(1), int(match.group(2))
+
+    def available_fields(self, snapshot=None):
+        """Return physical FARGO3D fields detected in the output directory.
+
+        Detection follows the FARGO3D convention ``<field><snapshot>.dat`` for
+        scalars and ``<base>{x,y,z}<snapshot>.dat`` for vectors, plus a binary-size
+        check against ``NX*NY*NZ`` values. Numbered outputs are grouped by their
+        physical field stem, so ``gasdens0.dat``, ``gasdens1.dat`` and
+        ``gasdens10.dat`` all appear only once as ``gasdens``.
+
+        Parameters
+        ----------
+        snapshot : int or None
+            If an integer is provided, only files belonging exactly to that
+            snapshot are considered. If None, all snapshots are scanned and
+            grouped into the same physical field names.
         """
         if not hasattr(self, "output_dir") or self.output_dir is None:
             return {}
         if not os.path.isdir(self.output_dir):
             return {}
 
-        snapshot = int(snapshot)
-        suffix = f"{snapshot}.dat"
-        candidates = [name for name in os.listdir(self.output_dir) if name.endswith(suffix)]
+        requested_snapshot = None if snapshot is None else int(snapshot)
 
-        grouped = {}
-        for name in candidates:
-            stem = name[: -len(suffix)]
-            if stem and stem[-1] in ("x", "y", "z"):
-                base = stem[:-1]
-                grouped.setdefault(base, set()).add(stem[-1])
-            else:
-                grouped.setdefault(stem, set()).add("")
+        stems = set()
+        for name in os.listdir(self.output_dir):
+            stem, file_snapshot = self._split_numbered_dat_filename(name)
+            if stem is None:
+                continue
+            if requested_snapshot is not None and file_snapshot != requested_snapshot:
+                continue
+            if not self._field_file_has_grid_size(name):
+                continue
+            if not self._looks_like_fargo3d_field_stem(stem):
+                continue
+            stems.add(stem)
 
         detected = {}
-        expected_components = ["x", "y"] + (["z"] if getattr(self.vars, "DIM", 3) == 3 else [])
-        for field, components in grouped.items():
-            if not field:
-                continue
-            scalar_file = f"{field}{suffix}"
-            if "" in components and scalar_file in candidates:
-                detected[field] = "scalar"
-                continue
+        expected_components = self._vector_components_for_dimension()
+        consumed_components = set()
 
-            component_files = [f"{field}{comp}{suffix}" for comp in expected_components]
-            if all(component in candidates for component in component_files):
-                detected[field] = "vector"
+        # Collapse complete vector component families. A trailing x/y/z is treated
+        # as a vector component only when the complete dimensional component set
+        # exists. This preserves scalar names such as gasenergy.
+        for stem in sorted(stems):
+            if stem[-1] not in ("x", "y", "z"):
+                continue
+            base = stem[:-1]
+            if not self._looks_like_fargo3d_field_stem(base):
+                continue
+            component_stems = {f"{base}{comp}" for comp in expected_components}
+            if component_stems.issubset(stems):
+                detected[base] = "vector"
+                consumed_components.update(component_stems)
+
+        # Remaining valid datacubes are scalars. Individual vector components are
+        # deliberately hidden from the catalog.
+        for stem in sorted(stems):
+            if stem in consumed_components:
+                continue
+            detected[stem] = "scalar"
 
         return detected
 
     def _infer_field_type(self, field, snapshot=0):
-        """Infer the field type from the files present in the output directory."""
+        """Infer a physical field type from validated FARGO3D output files."""
         snapshot = int(snapshot)
+        field = self._canonical_field_name(field, snapshot=snapshot)
         detected = self.available_fields(snapshot=snapshot)
         if field in detected:
             return detected[field]
 
-        # If user passed a component-specific name (e.g. 'dust1vx'), try to
-        # resolve it to the vector base (e.g. 'dust1v') before falling back to
-        # scalar detection. This allows callers to pass any of the component
-        # filenames and still get the full vector behaviour.
-        if len(field) > 1 and field[-1] in ("x", "y", "z"):
-            base = field[:-1]
-            if base in detected:
-                return detected[base]
-
-        # Check scalar file
-        scalar_file = os.path.join(self.output_dir, f"{field}{snapshot}.dat")
-        if os.path.isfile(scalar_file):
+        # Fallback for callers that inspect a directory before available_fields()
+        # can be populated. Keep the same grid-size guard to avoid non-field .dat
+        # files being accepted as scalars.
+        scalar_name = f"{field}{snapshot}.dat"
+        if (self._looks_like_fargo3d_field_stem(field)
+                and self._field_file_has_grid_size(scalar_name)):
             return "scalar"
 
-        # Check vector components for the given field name or for a base name
-        components = ["x", "y"] + (['z'] if getattr(self.vars, "DIM", 3) == 3 else [])
-
-        # If a direct vector (field + comp) exists, it's a vector
-        vector_files = [os.path.join(self.output_dir, f"{field}{comp}{snapshot}.dat") for comp in components]
-        if all(os.path.isfile(component) for component in vector_files):
+        components = self._vector_components_for_dimension()
+        vector_names = [f"{field}{comp}{snapshot}.dat" for comp in components]
+        if all(self._field_file_has_grid_size(name) for name in vector_names):
             return "vector"
 
-        # If the provided name ends with a component letter, check the base
-        if len(field) > 1 and field[-1] in ("x", "y", "z"):
-            base = field[:-1]
-            vector_files = [os.path.join(self.output_dir, f"{base}{comp}{snapshot}.dat") for comp in components]
-            if all(os.path.isfile(component) for component in vector_files):
-                return "vector"
-
-        raise ValueError(f"Field type for '{field}' could not be inferred from output files.")
+        raise ValueError(f"Field type for '{field}' could not be inferred from physical output files.")
 
     def _load_field_raw(self, field, snapshot=0, field_type=None):
         """
@@ -1665,6 +1749,9 @@ class Simulation(fargopy.Fargobj):
         through `load_field` dispatching. This prevents recursion when higher-level
         helpers request raw data.
         """
+        # Resolve aliases such as gasvx -> gasv before composing filenames.
+        field = self._canonical_field_name(field, snapshot=snapshot)
+
         # Infer type if not provided
         if field_type is None:
             field_type = self._infer_field_type(field, snapshot=snapshot)
