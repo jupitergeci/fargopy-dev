@@ -245,7 +245,7 @@ class Field(fargopy.Fargobj):
     Load a field from a simulation object (returns a Field instance
     if interpolation is disabled or a FieldInterpolator otherwise):
     
-    >>> fp.Simulation.load_field(fields='gasdens', snapshot=0, interpolate=False)
+    >>> fp.Simulation.load_field(fields='gasdens', snapshot=0)
     
     Access data and mesh:
     
