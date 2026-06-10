@@ -65,6 +65,13 @@ setuptools.setup(
         "plotly",
         "pytest",
         "nbformat>=4.2.0",
+        "cartopy",
+        "pyvista[jupyter]",
+        "trame",
+        "trame-vtk",
+        "trame-vuetify",
+        "vtk",
+        "jupyter-server-proxy",
     ],
     python_requires=">=3.7",
     # ######################################################################

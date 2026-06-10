@@ -214,3 +214,28 @@ def test_interpolacion_2d_cartesian_full_mesh_no_nan_seam(sim2d):
     )
 
     assert np.isfinite(valor).all(), "The full 2D cartesian mesh must not leave a NaN seam"
+
+
+def test_slice_parser_accepts_pi_expressions(sim2d):
+    loader = fp.FieldInterpolator(sim2d)
+    ranges = loader._parse_slice_ranges("phi=[pi/2, 2*pi], theta=1.56")
+
+    assert np.isclose(ranges["phi"][0], np.pi / 2)
+    assert np.isclose(ranges["phi"][1], 2 * np.pi)
+    assert np.isclose(ranges["theta"][0], 1.56)
+    assert np.isclose(ranges["theta"][1], 1.56)
+
+
+def test_periodic_phi_slice_crosses_negative_domain(sim2d):
+    data = sim2d.load_field(
+        fields="gasdens",
+        slice="phi=[90 deg,270 deg]",
+        snapshot=0,
+        coords="cartesian",
+    )
+
+    row = data.df.iloc[0]
+    y_mesh = np.asarray(row.var2_mesh)
+
+    assert np.nanmin(y_mesh) < 0
+    assert np.nanmax(y_mesh) > 0
