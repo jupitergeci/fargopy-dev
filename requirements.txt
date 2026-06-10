@@ -14,3 +14,10 @@ pandas
 plotly
 pytest
 nbformat
+cartopy
+pyvista[jupyter]
+trame
+trame-vtk
+trame-vuetify
+vtk
+jupyter-server-proxy

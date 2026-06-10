@@ -7,6 +7,7 @@ import fargopy
 # Required packages
 ###############################################################
 import os
+import ast
 import numpy as np
 import re
 import re
@@ -52,6 +53,170 @@ COORDS_MAP = dict(
     cylindrical = dict(phi='x',r='y',z='z'),
     spherical = dict(phi='x',r='y',theta='z'),
 )
+
+
+def _safe_numeric_expression(value):
+    """Parse a numeric slice token supporting radians, degrees, and pi expressions."""
+    text = str(value).strip().lower().replace("np.pi", "pi")
+    if not text:
+        raise ValueError("Empty slice expression")
+
+    degree_match = re.fullmatch(r"(.+?)\s*deg", text)
+    if degree_match:
+        return np.deg2rad(_safe_numeric_expression(degree_match.group(1)))
+
+    text = re.sub(r"(?<=\d)\s*pi\b", "*pi", text)
+    text = re.sub(r"(?<=\))\s*pi\b", "*pi", text)
+
+    allowed_names = {"pi": np.pi, "e": np.e}
+    allowed_nodes = (
+        ast.Expression,
+        ast.BinOp,
+        ast.UnaryOp,
+        ast.Add,
+        ast.Sub,
+        ast.Mult,
+        ast.Div,
+        ast.Pow,
+        ast.Mod,
+        ast.USub,
+        ast.UAdd,
+        ast.Constant,
+        ast.Name,
+        ast.Load,
+    )
+
+    def _eval(node):
+        if not isinstance(node, allowed_nodes):
+            raise ValueError(f"Unsupported slice expression: {value}")
+        if isinstance(node, ast.Expression):
+            return _eval(node.body)
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return float(node.value)
+            raise ValueError(f"Unsupported slice expression: {value}")
+        if isinstance(node, ast.Name):
+            if node.id in allowed_names:
+                return float(allowed_names[node.id])
+            raise ValueError(f"Unsupported slice expression: {value}")
+        if isinstance(node, ast.UnaryOp):
+            operand = _eval(node.operand)
+            if isinstance(node.op, ast.UAdd):
+                return +operand
+            if isinstance(node.op, ast.USub):
+                return -operand
+        if isinstance(node, ast.BinOp):
+            left = _eval(node.left)
+            right = _eval(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, ast.Div):
+                return left / right
+            if isinstance(node.op, ast.Pow):
+                return left ** right
+            if isinstance(node.op, ast.Mod):
+                return left % right
+        raise ValueError(f"Unsupported slice expression: {value}")
+
+    try:
+        parsed = ast.parse(text, mode="eval")
+        return float(_eval(parsed))
+    except Exception as exc:
+        raise ValueError(f"Could not parse numeric slice token '{value}'") from exc
+
+
+def _parse_slice_spec(slice_str):
+    """Parse a slice expression into key/value pairs with numeric values."""
+    spec = {}
+    if not slice_str:
+        return spec
+
+    pattern = re.compile(r"(?<!\w)(x|y|z|r|phi|theta)\s*=\s*(\[[^\]]*\]|[^,]+)", re.IGNORECASE)
+    for key, raw in pattern.findall(str(slice_str)):
+        key = key.lower()
+        raw = raw.strip()
+        if raw.startswith("[") and raw.endswith("]"):
+            values = [item.strip() for item in raw[1:-1].split(",") if item.strip()]
+            if len(values) != 2:
+                raise ValueError(f"Slice range for '{key}' must contain exactly two values")
+            parsed = tuple(_safe_numeric_expression(item) for item in values)
+            spec[key] = parsed
+        else:
+            spec[key] = _safe_numeric_expression(raw)
+    return spec
+
+
+def _axis_is_periodic(axis_values, period=2 * np.pi, atol=1e-8):
+    axis = np.asarray(axis_values, dtype=float)
+    if axis.size < 2:
+        return False
+    span = float(axis.max() - axis.min())
+    step = float(np.abs(axis[1] - axis[0]))
+    return span >= period - 2 * step - atol
+
+
+def _normalize_periodic_value(value, axis_values, period=2 * np.pi):
+    axis = np.asarray(axis_values, dtype=float)
+    base = float(axis.min())
+    return ((np.asarray(value, dtype=float) - base) % period) + base
+
+
+def _normalize_periodic_bounds(bounds, axis_values, period=2 * np.pi, atol=1e-8):
+    axis = np.asarray(axis_values, dtype=float)
+    lo, hi = sorted((float(bounds[0]), float(bounds[1])))
+    if (hi - lo) >= period - atol:
+        return (float(axis.min()), float(axis.max())), True
+    lo = float(_normalize_periodic_value(lo, axis, period=period))
+    hi = float(_normalize_periodic_value(hi, axis, period=period))
+    return (lo, hi), False
+
+
+def _axis_selector(axis_values, selector, periodic=False):
+    axis = np.asarray(axis_values, dtype=float)
+    if selector is None:
+        return slice(None)
+
+    if isinstance(selector, (list, tuple)) and len(selector) == 2:
+        bounds = tuple(selector)
+        if periodic and _axis_is_periodic(axis):
+            normalized, full_circle = _normalize_periodic_bounds(bounds, axis)
+            if full_circle:
+                return slice(None)
+            lo, hi = normalized
+            lo_idx = int(np.abs(axis - lo).argmin())
+            hi_idx = int(np.abs(axis - hi).argmin())
+            if lo_idx <= hi_idx:
+                return slice(lo_idx, hi_idx + 1)
+            return np.concatenate((np.arange(lo_idx, axis.size), np.arange(0, hi_idx + 1)))
+
+        lo, hi = sorted((float(bounds[0]), float(bounds[1])))
+        lo_idx = int(np.abs(axis - lo).argmin())
+        hi_idx = int(np.abs(axis - hi).argmin())
+        if lo_idx > hi_idx:
+            lo_idx, hi_idx = hi_idx, lo_idx
+        return slice(lo_idx, hi_idx + 1)
+
+    value = float(selector)
+    if periodic and _axis_is_periodic(axis):
+        value = float(_normalize_periodic_value(value, axis))
+    return int(np.abs(axis - value).argmin())
+
+
+def _apply_indexer(arr, indexer, axis):
+    """Apply a slice or index array along a given axis."""
+    if isinstance(indexer, slice):
+        slicer = [slice(None)] * arr.ndim
+        slicer[axis] = indexer
+        return arr[tuple(slicer)]
+
+    if np.isscalar(indexer):
+        return np.take(arr, int(indexer), axis=axis)
+
+    return np.take(arr, indexer, axis=axis)
 
 ###############################################################
 # Classes
@@ -141,60 +306,94 @@ class Field(fargopy.Fargobj):
         
         >>> plt.pcolormesh(mesh.x, mesh.y, field_slice)
         """
-        # Analysis of the slice 
         if slice is None:
-            slice, pattern = self._slice(pattern=True, verbose=verbose)
-        else:
-            # Degrees specification
-            slice = slice.replace('deg','*fargopy.DEG')
+            if self.coordinates == 'cartesian':
+                z, y, x = np.meshgrid(self.domains.z, self.domains.y, self.domains.x, indexing='ij')
+                mesh = fargopy.Dictobj(dict=dict(x=x, y=y, z=z))
 
-            # Perform the slice
-            slice_cmd = f"self._slice({slice},pattern=True,verbose={verbose})"
-            slice,pattern = eval(slice_cmd)
-        
-        # Create the mesh
+            if self.coordinates == 'polar':
+                phi, r = np.meshgrid(self.domains.phi, self.domains.r, indexing='xy')
+                x = phi
+                y = r
+                z = np.zeros_like(x)
+
+                mesh = fargopy.Dictobj(dict=dict(phi=x, r=y, x=x, y=y, z=z))
+
+            if self.coordinates == 'cylindrical':
+                z, r, phi = np.meshgrid(self.domains.z, self.domains.r, self.domains.phi, indexing='ij')
+                x, y, z = r * np.cos(phi), r * np.sin(phi), z
+
+                mesh = fargopy.Dictobj(dict=dict(r=r, phi=phi, x=x, y=y, z=z))
+
+            if self.coordinates == 'spherical':
+                theta, r, phi = np.meshgrid(self.domains.theta, self.domains.r, self.domains.phi, indexing='ij')
+                x, y, z = r * np.sin(theta) * np.cos(phi), r * np.sin(theta) * np.sin(phi), r * np.cos(theta)
+
+                mesh = fargopy.Dictobj(dict=dict(r=r, phi=phi, theta=theta, x=x, y=y, z=z))
+
+            return self.data, mesh
+
+        spec = _parse_slice_spec(slice)
+        reverse_map = {alias: native for native, alias in COORDS_MAP.get(self.coordinates, {}).items()}
+        selectors = {}
+        for key, selector in spec.items():
+            selectors[reverse_map.get(key, key)] = selector
+
         if self.coordinates == 'cartesian':
-            z,y,x = np.meshgrid(self.domains.z,self.domains.y,self.domains.x,indexing='ij')
-            x = eval(f"x[{pattern}]")
-            y = eval(f"y[{pattern}]")
-            z = eval(f"z[{pattern}]")
-            
-            mesh = fargopy.Dictobj(dict=dict(x=x,y=y,z=z))
-
-        if self.coordinates == 'polar':
+            z, y, x = np.meshgrid(self.domains.z, self.domains.y, self.domains.x, indexing='ij')
+            mesh_arrays = dict(x=x, y=y, z=z)
+            axis_values = dict(z=np.asarray(self.domains.z), y=np.asarray(self.domains.y), x=np.asarray(self.domains.x))
+            axis_order = ['z', 'y', 'x']
+            periodic_axes = set()
+        elif self.coordinates == 'polar':
             phi, r = np.meshgrid(self.domains.phi, self.domains.r, indexing='xy')
-            x = eval(f"phi[{pattern}]")
-            y = eval(f"r[{pattern}]")
+            x = phi
+            y = r
             z = np.zeros_like(x)
+            mesh_arrays = dict(phi=x, r=y, x=x, y=y, z=z)
+            axis_values = dict(r=np.asarray(self.domains.r), phi=np.asarray(self.domains.phi))
+            axis_order = ['r', 'phi']
+            periodic_axes = {'phi'}
+        elif self.coordinates == 'cylindrical':
+            z, r, phi = np.meshgrid(self.domains.z, self.domains.r, self.domains.phi, indexing='ij')
+            x, y, z = r * np.cos(phi), r * np.sin(phi), z
+            mesh_arrays = dict(r=r, phi=phi, x=x, y=y, z=z)
+            axis_values = dict(z=np.asarray(self.domains.z), r=np.asarray(self.domains.r), phi=np.asarray(self.domains.phi))
+            axis_order = ['z', 'r', 'phi']
+            periodic_axes = {'phi'}
+        elif self.coordinates == 'spherical':
+            theta, r, phi = np.meshgrid(self.domains.theta, self.domains.r, self.domains.phi, indexing='ij')
+            x, y, z = r * np.sin(theta) * np.cos(phi), r * np.sin(theta) * np.sin(phi), r * np.cos(theta)
+            mesh_arrays = dict(r=r, phi=phi, theta=theta, x=x, y=y, z=z)
+            axis_values = dict(theta=np.asarray(self.domains.theta), r=np.asarray(self.domains.r), phi=np.asarray(self.domains.phi))
+            axis_order = ['theta', 'r', 'phi']
+            periodic_axes = {'phi'}
+        else:
+            raise ValueError(f"Unsupported coordinate system: {self.coordinates}")
 
-            mesh = fargopy.Dictobj(dict=dict(phi=x,r=y,x=x,y=y,z=z))
+        data = np.asarray(self.data)
+        data_axis_offset = 1 if self.type == 'vector' else 0
+        axis_index_map = {axis_name: idx for idx, axis_name in enumerate(axis_order)}
 
-        if self.coordinates == 'cylindrical':
-            z,r,phi = np.meshgrid(self.domains.z,self.domains.r,self.domains.phi,indexing='ij')
-            x,y,z = r*np.cos(phi),r*np.sin(phi),z
+        for axis_name in reversed(axis_order):
+            selector = selectors.get(axis_name)
+            if selector is None:
+                continue
+            indexer = _axis_selector(axis_values[axis_name], selector, periodic=axis_name in periodic_axes)
+            data = _apply_indexer(data, indexer, axis_index_map[axis_name] + data_axis_offset)
+            for mesh_name in mesh_arrays:
+                mesh_arrays[mesh_name] = _apply_indexer(mesh_arrays[mesh_name], indexer, axis_index_map[axis_name])
 
-            x = eval(f"x[{pattern}]")
-            y = eval(f"y[{pattern}]")
-            z = eval(f"z[{pattern}]")
-            r = eval(f"r[{pattern}]")
-            phi = eval(f"phi[{pattern}]")
+        if self.coordinates == 'cartesian':
+            mesh = fargopy.Dictobj(dict=dict(x=mesh_arrays['x'], y=mesh_arrays['y'], z=mesh_arrays['z']))
+        elif self.coordinates == 'polar':
+            mesh = fargopy.Dictobj(dict=dict(phi=mesh_arrays['phi'], r=mesh_arrays['r'], x=mesh_arrays['x'], y=mesh_arrays['y'], z=mesh_arrays['z']))
+        elif self.coordinates == 'cylindrical':
+            mesh = fargopy.Dictobj(dict=dict(r=mesh_arrays['r'], phi=mesh_arrays['phi'], x=mesh_arrays['x'], y=mesh_arrays['y'], z=mesh_arrays['z']))
+        else:
+            mesh = fargopy.Dictobj(dict=dict(r=mesh_arrays['r'], phi=mesh_arrays['phi'], theta=mesh_arrays['theta'], x=mesh_arrays['x'], y=mesh_arrays['y'], z=mesh_arrays['z']))
 
-            mesh = fargopy.Dictobj(dict=dict(r=r,phi=phi,x=x,y=y,z=z))
-
-        if self.coordinates == 'spherical':
-            theta,r,phi = np.meshgrid(self.domains.theta,self.domains.r,self.domains.phi,indexing='ij')
-            x,y,z = r*np.sin(theta)*np.cos(phi),r*np.sin(theta)*np.sin(phi),r*np.cos(theta)
-
-            x = eval(f"x[{pattern}]")
-            y = eval(f"y[{pattern}]")
-            z = eval(f"z[{pattern}]")
-            r = eval(f"r[{pattern}]")
-            phi = eval(f"phi[{pattern}]")
-            theta = eval(f"theta[{pattern}]")
-
-            mesh = fargopy.Dictobj(dict=dict(r=r,phi=phi,theta=theta,x=x,y=y,z=z))
-
-        return slice,mesh
+        return data, mesh
 
     def _slice(self,verbose=False,pattern=False,**kwargs):
         """
@@ -588,23 +787,16 @@ class FieldInterpolator(fargopy.Fargobj):
         ranges = {"r": None, "theta": None, "phi": None, "z": None}
         if not slice_str:
             return ranges
-        txt = slice_str.lower()
 
-        def _to_float(value):
-            value = value.strip()
-            match = re.match(r"(-?\d+(?:\.\d+)?)\s*deg", value)
-            return np.deg2rad(float(match.group(1))) if match else float(value)
-
-        range_pattern = re.compile(r"(r|theta|phi|z)=\[(.+?)\]")
-        value_pattern = re.compile(r"(r|theta|phi|z)=([^\[\],]+)")
-
-        for key, vals in range_pattern.findall(txt):
-            lo, hi = [_to_float(v) for v in vals.split(",")]
-            ranges[key] = (min(lo, hi), max(lo, hi))
-        for key, val in value_pattern.findall(txt):
-            if ranges.get(key) is None:
-                parsed = _to_float(val)
-                ranges[key] = (parsed, parsed)
+        spec = _parse_slice_spec(slice_str)
+        for key in ranges.keys():
+            value = spec.get(key)
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple)):
+                ranges[key] = (min(value), max(value))
+            else:
+                ranges[key] = (value, value)
         return ranges
 
     def _infer_slice_dim(self, coords_system, slice_ranges):
@@ -937,6 +1129,7 @@ class FieldInterpolator(fargopy.Fargobj):
                 normalized.append(f)
 
         self.fields = normalized
+        fields = normalized
         self.slice = slice
 
         # Convert snapshot into list - handle int, numpy types, and iterables
@@ -1350,48 +1543,38 @@ class FieldInterpolator(fargopy.Fargobj):
             theta_range = None
             z_range = [self.sim.domains.z.min(), self.sim.domains.z.max()]
 
-        # Regular expressions to extract parameters
-        range_pattern = re.compile(r"(\w+)=\[(.+?)\]")  # Matches ranges like r=[0.8,1.2]
-        value_pattern = re.compile(r"(\w+)=([-\d.]+)")  # Matches single values like phi=0 or z=0
-        degree_pattern = re.compile(r"([-\d.]+) deg")   # Matches angles in degrees like -25 deg
-
-        # Process ranges
-        for match in range_pattern.finditer(slice):
-            key, values = match.groups()
-            values = [float(degree_pattern.sub(lambda m: str(float(m.group(1)) * np.pi / 180), v.strip())) for v in values.split(',')]
-            if key == 'r':
-                r_range = values
-            elif key == 'phi':
-                phi_range = values
-            elif key == 'x' and coords == 'polar':
-                phi_range = values
-            elif key == 'y' and coords == 'polar':
-                r_range = values
-            elif key == 'theta':
-                theta_range = values if coords == 'spherical' else theta_range
-            elif key == 'z':
-                z_range = values if coords == 'cylindrical' else z_range
-
-        # Process single values
+        spec = _parse_slice_spec(slice)
         z_value = None
         theta_value = None
-        for match in value_pattern.finditer(slice):
-            key, value = match.groups()
-            value = float(degree_pattern.sub(lambda m: str(float(m.group(1)) * np.pi / 180), value))
-            if key == 'z':
-                z_value = value
-                if coords == 'cylindrical':
-                    z_range = [value, value]
+        for key, value in spec.items():
+            if key == 'r':
+                if isinstance(value, (list, tuple)):
+                    r_range = list(value)
+                else:
+                    r_range = [value, value]
             elif key == 'phi':
-                phi_range = [value, value]
+                if isinstance(value, (list, tuple)):
+                    phi_range = list(value)
+                else:
+                    phi_range = [value, value]
             elif key == 'x' and coords == 'polar':
-                phi_range = [value, value]
+                if isinstance(value, (list, tuple)):
+                    phi_range = list(value)
+                else:
+                    phi_range = [value, value]
             elif key == 'y' and coords == 'polar':
-                r_range = [value, value]
+                if isinstance(value, (list, tuple)):
+                    r_range = list(value)
+                else:
+                    r_range = [value, value]
             elif key == 'theta':
-                theta_value = value
+                theta_value = value if not isinstance(value, (list, tuple)) else value[0]
                 if coords == 'spherical':
-                    theta_range = [value, value]
+                    theta_range = list(value) if isinstance(value, (list, tuple)) else [value, value]
+            elif key == 'z':
+                z_value = value if not isinstance(value, (list, tuple)) else value[0]
+                if coords == 'cylindrical':
+                    z_range = list(value) if isinstance(value, (list, tuple)) else [value, value]
 
         if coords == 'polar':
             phi = np.linspace(phi_range[0], phi_range[1], nphi)
@@ -1511,6 +1694,12 @@ class FieldInterpolator(fargopy.Fargobj):
         
         r_min, r_max = self._domain_limits['r']
         phi_min, phi_max = self._domain_limits['phi']
+        phi_axis = np.asarray(self.sim.domains.phi)
+        phi_periodic = _axis_is_periodic(phi_axis)
+        phi_bounds_norm = None
+        phi_bounds_full_circle = False
+        if phi_bounds is not None and phi_periodic:
+            phi_bounds_norm, phi_bounds_full_circle = _normalize_periodic_bounds(phi_bounds, phi_axis)
         
         # Get theta or z limits depending on coordinate system
         if coords == 'polar':
@@ -1536,7 +1725,13 @@ class FieldInterpolator(fargopy.Fargobj):
         def _phi_in_bounds(phi_vals):
             if phi_bounds is None:
                 return np.ones_like(phi_vals, dtype=bool)
-            lo, hi = phi_bounds
+            if phi_periodic:
+                if phi_bounds_full_circle:
+                    return np.ones_like(phi_vals, dtype=bool)
+                lo, hi = phi_bounds_norm
+                phi_vals = _normalize_periodic_value(phi_vals, phi_axis)
+            else:
+                lo, hi = phi_bounds
             if lo <= hi:
                 return (phi_vals >= lo - eps) & (phi_vals <= hi + eps)
             return (phi_vals >= lo - eps) | (phi_vals <= hi + eps)
@@ -2571,6 +2766,9 @@ class FieldInterpolator(fargopy.Fargobj):
                 else:
                     r_axis = np.asarray(self.sim.domains.r)
                     phi_axis = np.asarray(self.sim.domains.phi)
+                    phi_periodic = _axis_is_periodic(phi_axis)
+                    phi_bounds_norm = None
+                    phi_bounds_full_circle = False
 
                     if coords_original == 'polar':
                         query_r = np.asarray(var2_use).ravel()
@@ -2596,16 +2794,29 @@ class FieldInterpolator(fargopy.Fargobj):
                     else:
                         r_bounds = r_axis
                         phi_bounds = phi_axis
+                    if phi_bounds is not None:
+                        phi_bounds = (float(np.min(phi_bounds)), float(np.max(phi_bounds)))
+                    if phi_bounds is not None and phi_periodic:
+                        phi_bounds_norm, phi_bounds_full_circle = _normalize_periodic_bounds(phi_bounds, phi_axis)
                     r_min_plot, r_max_plot = np.min(r_bounds), np.max(r_bounds)
                     phi_min_plot, phi_max_plot = np.min(phi_bounds), np.max(phi_bounds)
                     eps = 1e-7
                     mask_valid = (query_r >= r_min_plot - eps) & (query_r <= r_max_plot + eps)
-                    if phi_axis.size > 1 and not full_circle:
-                        if phi_min_plot <= phi_max_plot:
-                            phi_mask = (query_phi >= phi_min_plot - eps) & (query_phi <= phi_max_plot + eps)
-                        else:
-                            phi_mask = (query_phi >= phi_min_plot - eps) | (query_phi <= phi_max_plot + eps)
-                        mask_valid &= phi_mask
+                    if phi_bounds is not None:
+                        if phi_periodic and not phi_bounds_full_circle:
+                            lo, hi = phi_bounds_norm
+                            query_phi = _normalize_periodic_value(query_phi, phi_axis)
+                            if lo <= hi:
+                                phi_mask = (query_phi >= lo - eps) & (query_phi <= hi + eps)
+                            else:
+                                phi_mask = (query_phi >= lo - eps) | (query_phi <= hi + eps)
+                            mask_valid &= phi_mask
+                        elif not phi_periodic:
+                            if phi_min_plot <= phi_max_plot:
+                                phi_mask = (query_phi >= phi_min_plot - eps) & (query_phi <= phi_max_plot + eps)
+                            else:
+                                phi_mask = (query_phi >= phi_min_plot - eps) | (query_phi <= phi_max_plot + eps)
+                            mask_valid &= phi_mask
 
                     # Roundoff on coordinates reconstructed from the same grid can
                     # push boundary points slightly outside the valid radius range.
