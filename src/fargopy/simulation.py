@@ -2088,6 +2088,7 @@ class Simulation(fargopy.Fargobj):
         if basename is None:
             base = getattr(self, "setup", "simulation")
             basename = f"{base}_snap{snapshot}"
+        filename = os.path.join(dir, basename)
 
         gasdens = self._load_field_raw(field="gasdens", snapshot=snapshot, field_type="scalar")
         gasv = self._load_field_raw(field="gasv", snapshot=snapshot, field_type="vector")

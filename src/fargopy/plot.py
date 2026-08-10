@@ -1,6 +1,8 @@
 ###############################################################
 # FARGOpy interdependencies
 ###############################################################
+from fileinput import filename
+
 import fargopy
 
 ###############################################################
@@ -278,12 +280,22 @@ class Plot(object):
             except Exception as e:
                 print(f"Warning computing counts: {e}")
 
-        fargopy.Plot.fargopy_mark(ax)
+        
         ax.set_aspect("equal")
-        ax.set_xlabel("x [AU]")
-        ax.set_ylabel("y [AU]")
+        ax.set_xlabel("X [AU]",size=12)
+        ax.set_ylabel("Y [AU]",size=12)
+        ax.set_xticklabels(ax.get_xticks(), size=10)
+        ax.set_yticklabels(ax.get_yticks(), size=10)
+
 
         if show:
+            fig.savefig("mesh.png",
+            dpi=600,
+            bbox_inches="tight",
+            pad_inches=0.05,
+            facecolor="white"
+            )
             plt.show()
+
 
         return fig, ax, nr_celdas_radial, nr_celdas_azimutal, n_inside
